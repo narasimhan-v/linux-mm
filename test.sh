@@ -1,0 +1,91 @@
+#!/bin/bash
+
+set -eux -o pipefail
+
+arch=$(uname -m)
+
+if [[ $(cat /sys/kernel/kexec_crash_size) == '0' ]]; then
+	echo '- error: kexec_crash_size = 0' >&2
+	exit 1
+fi
+
+if [[ "$arch" != 'ppc64le' ]] && \
+   [[ $(cat /sys/kernel/debug/cma/cma-reserved/count) == '0' ]]; then
+	echo '- error: cma-reserved/count = 0' >&2
+	exit 1
+fi
+
+if [[ "$arch" == 'x86_64' ]] && ! ls -l /dev/pmem0; then
+	echo '- error: /dev/pmem0 is gone.' >&2
+	exit 1
+fi
+
+echo function > /sys/kernel/debug/tracing/current_tracer
+echo nop > /sys/kernel/debug/tracing/current_tracer
+
+# Test memory online and offline.
+set +e
+i=0
+found=0
+for mem in $(ls -d /sys/devices/system/memory/memory*); do
+	((i++))
+	echo "iteration: $i: $mem"
+	echo offline > $mem/state
+	if [ $? -eq 0 ] && [ $found -eq 0 ]; then
+		found=1
+		continue
+	fi
+	echo online > $mem/state
+done
+set -e
+
+if [ ! -d ltp ]; then
+	git clone https://github.com/linux-test-project/ltp.git
+fi
+
+if [ ! -x /opt/ltp/runltp ]; then
+	cd ltp
+	make autotools
+	./configure
+
+	cpus=$(lscpu | sed -n 's/^CPU(s): *\([0-9]*\)/\1/p')
+	make -j "$cpus"
+	make install
+
+	# The kernel may lack of keyctl configs.
+	sed -i '/keyctl.*/d' /opt/ltp/runtest/syscalls
+
+	# Some openstack guests lack of random number generators that could hang
+	# for a long time.
+	sed -i '/getrandom.*/d' /opt/ltp/runtest/syscalls
+
+	# This test takes a long time and not worth running.
+	sed -i '/fork13.*/d' /opt/ltp/runtest/syscalls
+
+	if [[ "$arch" == "aarch64" ]]; then
+		# Those tests have too much CPU load for KASAN_SW_TAGS. See,
+		# https://lore.kernel.org/linux-arm-kernel/7ec14ad5-8d64-b842-a819-9d57cc8495e2@lca.pw/
+		sed -i '/msgstress03.*/d' /opt/ltp/runtest/syscalls
+		sed -i '/msgstress04.*/d' /opt/ltp/runtest/syscalls
+		sed -i '/sendmsg02.*/d' /opt/ltp/runtest/syscalls
+	elif [[ "$arch" == 'ppc64le' ]]; then
+		# This test triggers unneeded OOMs all the time.
+		sed -i '/msgstress04.*/d' /opt/ltp/runtest/syscalls
+	fi
+	cd ..
+fi
+
+# Since CONFIG_X86_PTDUMP=m, reading all the sysfs files later needs this.
+if [[ "$arch" == 'x86_64' ]]; then
+	modprobe debug_pagetables
+fi
+
+# Don't care about the individual test case correctness here.
+set +e
+/opt/ltp/runltp -f syscalls,mm,fs,hugetlb
+
+dmesg | grep -i warn
+dmesg | grep -i bug | grep -v -i debug
+dmesg | grep -i error
+dmesg | grep -i leak
+dmesg | grep -i undefined
