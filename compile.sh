@@ -119,7 +119,8 @@ fi
 
 set +e
 for i in mm/ tlb hmm hugetlb memblock mm.h gfp mmzone memory_hotplug vmalloc \
-    slab slub shmem zbud zpool zsmalloc hmat pmem memremap iommu; do
+    slab slub shmem zbud zpool zsmalloc hmat pmem memremap iommu sched \
+    "[^a-z]dma[^a-z]"; do
 	grep $i warn.txt | grep -v 'Wmissing-prototypes' |
 	    grep -v 'unction parameter'
 done
