@@ -1,5 +1,7 @@
 #!/bin/bash
 
+custom="$1"
+
 set -eux -o pipefail
 
 arch=$(uname -m)
@@ -64,7 +66,7 @@ fi
 git diff > "$diff"
 
 set +u
-if [ -z "$1" ]; then
+if [ -z "$custom" ]; then
 	# Just in case ...
 	if [[ $(git branch | grep \* | cut -d ' ' -f2) != 'next' ]]; then
 		git checkout next
@@ -99,7 +101,7 @@ if lvs | grep root && ! lsmod | grep dm_mod; then
 fi
 
 # Some Openstack VMs may need this.
-if ! grep 'saved_entry=0' /boot/grub2/grubenv; then
+if ! grep 'saved_entry=0' /boot/grub2/grubenv && [ -z "$custom" ]; then
 	grub2-editenv - set saved_entry=0
 fi
 
