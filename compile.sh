@@ -61,14 +61,18 @@ else
 	git remote update
 fi
 
-# Just in case ...
-if [[ $(git branch | grep \* | cut -d ' ' -f2) != 'next' ]]; then
-	git checkout next
-fi
-
 git diff > "$diff"
 
-git reset --hard linux-next/master
+set +u
+if [ -z "$1" ]; then
+	# Just in case ...
+	if [[ $(git branch | grep \* | cut -d ' ' -f2) != 'next' ]]; then
+		git checkout next
+	fi
+
+	git reset --hard linux-next/master
+fi
+set -u
 
 for i in $(ls -t ../patch/*); do
 	git am $i
