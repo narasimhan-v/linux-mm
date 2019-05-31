@@ -124,9 +124,9 @@ if [[ "$arch" == 'aarch64' ]]; then
 fi
 
 set +e
-for i in mm/ tlb hmm hugetlb memblock mm.h gfp mmzone memory_hotplug vmalloc \
-    slab slub shmem zbud zpool zsmalloc hmat pmem memremap iommu sched \
-    "[^a-z]dma[^a-z]"; do
+for i in mm/ tlb hmm hugetlb memblock mm.h gfp mmzone memory vmalloc slab \
+    slub shmem zbud zpool zsmalloc hmat pmem memremap iommu sched numa memmap \
+    memremap iomem '[^a-z]node' '[^a-z]efi' '[^a-z]dma[^a-z]'; do
 	grep $i warn.txt | grep -v 'Wmissing-prototypes' |
 	    grep -v 'unction parameter'
 done
