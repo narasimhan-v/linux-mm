@@ -73,6 +73,8 @@ if [ -z "$custom" ]; then
 	fi
 
 	git reset --hard linux-next/master
+else
+	git reset --hard
 fi
 set -u
 
