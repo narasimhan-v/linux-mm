@@ -78,7 +78,7 @@ else
 fi
 set -u
 
-for i in $(ls -t ../patch/*); do
+for i in $(ls ../patch/*); do
 	git am $i
 done
 
