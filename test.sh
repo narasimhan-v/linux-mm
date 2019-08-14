@@ -89,3 +89,4 @@ dmesg | grep -i bug | grep -v -i debug
 dmesg | grep -i error
 dmesg | grep -i leak
 dmesg | grep -i undefined
+dmesg | grep -i corruption
