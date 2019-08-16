@@ -92,7 +92,7 @@ fi
 
 make W=1 CC=$cc -j $cpus 2> warn.txt
 make CC=$cc modules_install
-make install
+make CC=$cc install
 
 # The Fedora Linux 30 has CONFIG_BLK_DEV_DM_BUILTIN=y, so need to include dm-mod
 # manually for a LVM rootfs.
