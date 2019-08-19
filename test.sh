@@ -4,12 +4,13 @@ set -eux -o pipefail
 
 arch=$(uname -m)
 
-if [[ $(cat /sys/kernel/kexec_crash_size) == '0' ]]; then
+if [ ! -f /sys/kernel/kexec_crash_size ] ||
+   [[ $(cat /sys/kernel/kexec_crash_size) == '0' ]]; then
 	echo '- error: kexec_crash_size = 0' >&2
 	exit 1
 fi
 
-if [[ "$arch" != 'ppc64le' ]] && \
+if [[ "$arch" != 'ppc64le' ]] &&
    [[ $(cat /sys/kernel/debug/cma/cma-reserved/count) == '0' ]]; then
 	echo '- error: cma-reserved/count = 0' >&2
 	exit 1
