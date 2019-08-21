@@ -44,7 +44,11 @@ if [ ! -f .config ]; then
 		cp ../powerpc.config .config
 	elif [[ "$arch" == 'x86_64' ]]; then
 		serial=$(sed 's/.* console=\(ttyS[0-9]*\,[0-9]*\).*/\1/' <<<"$old")
-		grub2-editenv - set "$old $common earlyprintk=$serial"
+
+		# There is a bug that "memmap=4G!4G" must not be used in
+		# CONFIG_CMDLINE with CONFIG_RANDOMIZE_BASE. More detail see,
+		# https://lore.kernel.org/linux-mm/1566421927.5576.3.camel@lca.pw/
+		grub2-editenv - set "$old $common earlyprintk=$serial memmap=4G!4G"
 		cp ../x86.config .config
 	else
 		echo '- error: unsupported arch.' >&2
