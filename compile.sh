@@ -43,7 +43,8 @@ if [ ! -f .config ]; then
 		grub2-editenv - set "$old $new $common earlyprintk"
 		cp ../powerpc.config .config
 	elif [[ "$arch" == 'x86_64' ]]; then
-		grub2-editenv - set "$old $common"
+		serial=$(sed 's/.* console=\(ttyS[0-9]*\,[0-9]*\).*/\1/' <<<"$old")
+		grub2-editenv - set "$old $common earlyprintk=$serial"
 		cp ../x86.config .config
 	else
 		echo '- error: unsupported arch.' >&2
