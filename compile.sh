@@ -107,8 +107,7 @@ if lvs | grep root && ! lsmod | grep dm_mod; then
 	dracut --add-drivers dm-mod -f "$initrd" "$kver"
 fi
 
-# Some Openstack VMs may need this.
-if ! grep 'saved_entry=0' /boot/grub2/grubenv && [ -z "$custom" ]; then
+if ! grep 'saved_entry=0$' /boot/grub2/grubenv && [ -z "$custom" ]; then
 	grub2-editenv - set saved_entry=0
 fi
 
