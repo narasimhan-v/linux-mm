@@ -7,10 +7,22 @@ set -eux -o pipefail
 arch=$(uname -m)
 cpus=$(lscpu | sed -n 's/^CPU(s): *\([0-9]*\)/\1/p')
 cc=gcc
-old=$(grep 'kernelopts=' /boot/grub2/grubenv)
-new="page_poison=on crashkernel=512M page_owner=on numa_balancing=enable \
+
+args="page_poison=on page_owner=on numa_balancing=enable \
 systemd.unified_cgroup_hierarchy=1 debug_guardpage_minorder=1 \
 page_alloc.shuffle=1"
+
+if [[ "$arch" == 's390x' ]]; then
+	old=$(grep 'options ' /boot/loader/entries/*-$(uname -r).conf)
+	new="$old $args crashkernel=16M"
+else
+	old=$(grep 'kernelopts=' /boot/grub2/grubenv)
+	new="$args crashkernel=512M"
+fi
+
+# SELinux for developers remains a pipe dream.
+common='selinux=0 audit=0'
+
 diff='/tmp/test.patch'
 
 if [ ! -d linux ]; then
@@ -28,12 +40,13 @@ fi
 
 if [ ! -f .config ]; then
 	yum -y install openssl-devel make gcc bc bison flex ncurses-devel \
-	    autoconf automake numactl-devel libaio-devel libattr-devel \
-	    libcap-devel libgcrypt-devel keyutils-libs zlib-devel \
-	    elfutils-libelf-devel grubby wget tar numactl patch time
+	    autoconf automake libaio-devel libattr-devel libcap-devel \
+	    libgcrypt-devel keyutils-libs zlib-devel elfutils-libelf-devel \
+	    grubby wget tar patch time
 
-	# SELinux for developers remains a pipe dream.
-	common='selinux=0 audit=0'
+	if [[ "$arch" != 's390x' ]]; then
+		yum -y install numactl-devel numactl
+	fi
 
 	if [[ "$arch" == 'aarch64' ]]; then
 		grub2-editenv - set "$old $common"
@@ -48,8 +61,14 @@ if [ ! -f .config ]; then
 		# There is a bug that "memmap=4G!4G" must not be used in
 		# CONFIG_CMDLINE with CONFIG_RANDOMIZE_BASE. More detail see,
 		# https://lore.kernel.org/linux-mm/1566421927.5576.3.camel@lca.pw/
-		grub2-editenv - set "$old $common earlyprintk=$serial memmap=4G!4G"
+		grub2-editenv - set \
+		    "$old $common earlyprintk=$serial memmap=4G!4G"
 		cp ../x86.config .config
+	elif [[ "$arch" == 's390x' ]]; then
+		sed -i 's/^timeout=.*/timeout=30/' /etc/zipl.conf
+		sed -i "s;$old;$old $common;" \
+		    /boot/loader/entries/*-$(uname -r).conf
+		cp ../s390.config .config
 	else
 		echo '- error: unsupported arch.' >&2
 		exit 1
@@ -99,7 +118,7 @@ make W=1 CC=$cc -j $cpus 2> warn.txt
 make CC=$cc modules_install
 make CC=$cc install
 
-# The Fedora Linux 30 has CONFIG_BLK_DEV_DM_BUILTIN=y, so need to include dm-mod
+# Some kernels have CONFIG_BLK_DEV_DM_BUILTIN=y, so need to include dm-mod
 # manually for a LVM rootfs.
 if lvs | grep root && ! lsmod | grep dm_mod; then
 	initrd=$(ls -t /boot/initramfs-* | head -1)
@@ -107,7 +126,16 @@ if lvs | grep root && ! lsmod | grep dm_mod; then
 	dracut --add-drivers dm-mod -f "$initrd" "$kver"
 fi
 
-if ! grep 'saved_entry=0$' /boot/grub2/grubenv && [ -z "$custom" ]; then
+if [[ "$arch" == 's390x' ]]; then
+	vmlinuz=$(ls -t /boot/vmlinuz-* | head -1)
+	vmlinuz=$(basename $vmlinuz)
+
+	loader=$(ls /boot/loader/entries/*${vmlinuz##vmlinuz}.conf)
+	if ! grep "$args" $loader; then
+		sed -i "s;^options .*;$new earlyprintk;" $loader
+	fi
+	zipl
+elif ! grep 'saved_entry=0$' /boot/grub2/grubenv && [ -z "$custom" ]; then
 	grub2-editenv - set saved_entry=0
 fi
 
