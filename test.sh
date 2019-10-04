@@ -63,7 +63,7 @@ if [ ! -x /opt/ltp/runltp ]; then
 	# This test takes a long time and not worth running.
 	sed -i '/fork13.*/d' /opt/ltp/runtest/syscalls
 
-	if [[ "$arch" == "aarch64" ]]; then
+	if [[ "$arch" == "aarch64" ]] || [[ "$arch" == "s390x" ]]; then
 		# Those tests have too much CPU load for KASAN_SW_TAGS. See,
 		# https://lore.kernel.org/linux-arm-kernel/7ec14ad5-8d64-b842-a819-9d57cc8495e2@lca.pw/
 		sed -i '/msgstress03.*/d' /opt/ltp/runtest/syscalls
