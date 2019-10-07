@@ -6,14 +6,17 @@ arch=$(uname -m)
 
 if [ ! -f /sys/kernel/kexec_crash_size ] ||
    [[ $(cat /sys/kernel/kexec_crash_size) == '0' ]]; then
-	echo '- error: kexec_crash_size = 0' >&2
+	echo '- error: kexec_crash_size' >&2
 	exit 1
 fi
 
-if [[ "$arch" != 'ppc64le' ]] &&
-   [[ $(cat /sys/kernel/debug/cma/cma-reserved/count) == '0' ]]; then
-	echo '- error: cma-reserved/count = 0' >&2
-	exit 1
+# The powerpc has CONFIG_HAVE_DMA_CONTIGUOUS=n.
+if [[ "$arch" != 'ppc64le' ]]; then
+	if [ ! -f /sys/kernel/debug/cma/cma-reserved/count ] ||
+	   [[ $(cat /sys/kernel/debug/cma/cma-reserved/count) == '0' ]]; then
+		echo '- error: cma-reserved/count' >&2
+		exit 1
+	fi
 fi
 
 if [[ "$arch" == 'x86_64' ]] && ! ls -l /dev/pmem0; then
@@ -63,7 +66,7 @@ if [ ! -x /opt/ltp/runltp ]; then
 	# This test takes a long time and not worth running.
 	sed -i '/fork13.*/d' /opt/ltp/runtest/syscalls
 
-	if [[ "$arch" == "aarch64" ]] || [[ "$arch" == "s390x" ]]; then
+	if [[ "$arch" == 'aarch64' ]] || [[ "$arch" == 's390x' ]]; then
 		# Those tests have too much CPU load for KASAN_SW_TAGS. See,
 		# https://lore.kernel.org/linux-arm-kernel/7ec14ad5-8d64-b842-a819-9d57cc8495e2@lca.pw/
 		sed -i '/msgstress03.*/d' /opt/ltp/runtest/syscalls
