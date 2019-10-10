@@ -66,16 +66,21 @@ if [ ! -x /opt/ltp/runltp ]; then
 	# This test takes a long time and not worth running.
 	sed -i '/fork13.*/d' /opt/ltp/runtest/syscalls
 
-	if [[ "$arch" == 'aarch64' ]] || [[ "$arch" == 's390x' ]]; then
+	case "$arch" in
+	's390x')
+		# This test sometimes triggers unneeded OOMs.
+		sed -i '/msgstress02.*/d' /opt/ltp/runtest/syscalls
+		;& # fall-through
+	'aarch64')
 		# Those tests have too much CPU load for KASAN_SW_TAGS. See,
 		# https://lore.kernel.org/linux-arm-kernel/7ec14ad5-8d64-b842-a819-9d57cc8495e2@lca.pw/
 		sed -i '/msgstress03.*/d' /opt/ltp/runtest/syscalls
-		sed -i '/msgstress04.*/d' /opt/ltp/runtest/syscalls
 		sed -i '/sendmsg02.*/d' /opt/ltp/runtest/syscalls
-	elif [[ "$arch" == 'ppc64le' ]]; then
+		;& # fall-through
+	'ppc64le')
 		# This test triggers unneeded OOMs all the time.
 		sed -i '/msgstress04.*/d' /opt/ltp/runtest/syscalls
-	fi
+	esac
 	cd ..
 fi
 
