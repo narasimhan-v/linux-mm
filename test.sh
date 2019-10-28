@@ -91,7 +91,7 @@ fi
 
 # Don't care about the individual test case correctness here.
 set +e
-/opt/ltp/runltp -f syscalls,mm,fs,hugetlb
+/opt/ltp/runltp -f syscalls,mm,fs,hugetlb,cpuhotplug
 
 dmesg | grep -i warn
 dmesg | grep -i bug | grep -v -i debug

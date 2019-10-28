@@ -28,6 +28,8 @@ diff='/tmp/test.patch'
 if [ ! -d linux ]; then
 	git clone \
 	    https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+	ln -s $PWD/linux /usr/src/
+
 	cd linux
 	git remote add linux-next \
 	    https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
@@ -42,7 +44,7 @@ if [ ! -f .config ]; then
 	yum -y install openssl-devel make gcc bc bison flex ncurses-devel \
 	    autoconf automake libaio-devel libattr-devel libcap-devel \
 	    libgcrypt-devel keyutils-libs zlib-devel elfutils-libelf-devel \
-	    grubby wget tar patch time
+	    grubby wget tar patch time sysstat
 
 	if [[ "$arch" != 's390x' ]]; then
 		yum -y install numactl-devel numactl
