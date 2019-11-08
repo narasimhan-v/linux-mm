@@ -84,11 +84,6 @@ if [ ! -x /opt/ltp/runltp ]; then
 	cd ..
 fi
 
-# Since CONFIG_X86_PTDUMP=m, reading all the sysfs files later needs this.
-if [[ "$arch" == 'x86_64' ]]; then
-	modprobe debug_pagetables
-fi
-
 # Don't care about the individual test case correctness here.
 set +e
 /opt/ltp/runltp -f syscalls,mm,fs,hugetlb,cpuhotplug
