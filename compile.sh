@@ -104,8 +104,8 @@ else
 fi
 set -u
 
-for i in $(ls ../patch/*); do
-	git am $i
+ls ../patch/* | while read i; do
+	git am "$i"
 done
 
 if [[ "$arch" == 'aarch64' ]]; then
