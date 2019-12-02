@@ -104,9 +104,11 @@ else
 fi
 set -u
 
+set +e
 ls ../patch/* | while read i; do
 	git am "$i"
 done
+set -e
 
 if [[ "$arch" == 'aarch64' ]]; then
 	cc=clang
