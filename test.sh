@@ -67,7 +67,7 @@ if [ ! -x /opt/ltp/runltp ]; then
 	sed -i '/fork13.*/d' /opt/ltp/runtest/syscalls
 
 	case "$arch" in
-	's390x')
+	's390x' | 'x86_64')
 		# This test sometimes triggers unneeded OOMs.
 		sed -i '/msgstress02.*/d' /opt/ltp/runtest/syscalls
 		;& # fall-through
