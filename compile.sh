@@ -44,7 +44,7 @@ if [ ! -f .config ]; then
 	yum -y install openssl-devel make gcc bc bison flex ncurses-devel \
 	    autoconf automake libaio-devel libattr-devel libcap-devel \
 	    libgcrypt-devel keyutils-libs zlib-devel elfutils-libelf-devel \
-	    grubby wget tar patch time sysstat jq
+	    grubby wget tar patch time sysstat jq runc qemu-kvm genisoimage
 
 	if [[ "$arch" != 's390x' ]]; then
 		yum -y install numactl-devel numactl
