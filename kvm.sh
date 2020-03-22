@@ -4,15 +4,21 @@ set -eux -o pipefail
 
 arch=$(uname -m)
 distro='ubuntu-18.04-server-cloudimg'
+bios=''
 
+case "$arch" in
+'x86_64')
+	image="$distro-amd64.img"
+	;;
+'aarch64')
+	bios='-bios /usr/share/AAVMF/AAVMF_CODE.fd -M gic-version=host'
+	image="$distro-arm64.img"
+	;;
+'ppc64le')
+	image="$distro-ppc64el.img"
+	;;
+esac
 if [ ! -f "$distro.qcow2" ]; then
-	case "$arch" in
-	'ppc64le')
-		image="$distro-ppc64el.img"
-		;;
-	'x86_64')
-		image="$distro-amd64.img"
-	esac
 	if [ ! -f "$image" ]; then
 		curl -O "https://cloud-images.ubuntu.com/releases/bionic/release/$image"
 	fi
@@ -33,5 +39,5 @@ EOF
 		user-data meta-data
 fi
 /usr/libexec/qemu-kvm -name "$distro" -cpu host -smp 2 -m 2G \
-	-hda "$distro.qcow2" -cdrom "$distro.iso" \
+	-hda "$distro.qcow2" -cdrom "$distro.iso" $bios \
 	-nic user,hostfwd=tcp::2222-:22 -serial mon:stdio
