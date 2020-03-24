@@ -3,6 +3,7 @@
 set -eux -o pipefail
 
 # Borrow from moby/download-frozen-image-v2.sh.
+error=0
 runc=${1:-'runc'}
 arch=$(uname -m)
 registryBase='https://registry-1.docker.io'
@@ -67,7 +68,7 @@ unset IFS
 layerMeta="${layers[0]}"
 digest="$(echo "$layerMeta" | jq --raw-output '.digest')"
 curlHeaders="$(
-	curl -S --progress \
+	curl -S --progress-bar \
 		-H "Authorization: Bearer $token" \
 		"$registryBase/v2/$image/blobs/$digest" \
 		-o layer.tar \
@@ -76,7 +77,7 @@ curlHeaders="$(
 curlHeaders="$(echo "$curlHeaders" | tr -d '\r')"
 blobRedirect="$(echo "$curlHeaders" |
 	awk -F ': ' 'tolower($1) == "location" { print $2; exit }')"
-curl -fSL --progress "$blobRedirect" -o layer.tar
+curl -fSL --progress-bar "$blobRedirect" -o layer.tar
 tar xvf layer.tar
 cd ..
 
@@ -126,7 +127,8 @@ fi
 out="$($runc ps root)"
 if ! [[ "$out" =~ 'sleep' ]]; then
 	echo "- error: unexpected ps output is $out." >&2
-	exit 1
+	# There is a runtime only cares about PIDs.
+	error=$((error + 1))
 fi
 # Only top command so far will accept SIGTERM.
 $runc kill root KILL
@@ -242,5 +244,92 @@ set +e
 out="$($runc run root 2>&1)"
 if ! [[ "$out" =~ 'Operation not permitted' ]]; then
 	echo "- error: unexpected seccomp output is $out." >&2
+	# There is a runtime with seccomp off by default.
+	error=$((error + 1))
+fi
+
+# Test rootfsPropagation==shared.
+# Assume the "/"  was mounted as shared.
+# Mount propagation rule could be tricky. If the source directory is on a
+# separate partition, it might end up with rootfsPropagation==private not
+# working as expected later, so just use /etc for now.
+cwd='/etc'
+rootfs="$(pwd)/rootfs"
+host="$cwd/runc"
+# Prepare rootfs like docker/libcontainer.
+mount -o bind "$rootfs" "$rootfs"
+mount --make-private "$rootfs"
+mv config.json config.json.orig
+# "cat /proc/self/mountinfo" to check if unsure.
+cat config.json.orig |
+	jq --arg cwd "$cwd" '.linux.rootfsPropagation = "shared" | .process.args = ["sleep", "60"] |
+		.mounts |= .+ [{"destination":"/rshared","options":["rbind"],"source":$cwd,"type":"bind"},
+		{"destination":"/rslave","options":["rbind","rslave"],"source":$cwd,"type":"bind"},
+		{"destination":"/rprivate","options":["rbind","rprivate"],"source":$cwd,"type":"bind"}]' \
+		> config.json
+$runc run -d root
+touch /tmp/host
+if [ ! -d "$host" ]; then
+	mkdir "$host"
+fi
+mount -o bind /tmp "$host"
+$runc exec root ls /rshared/runc/host
+$runc exec root ls /rslave/runc/host
+set +e
+$runc exec root ls /rprivate/runc/host
+if [ $? -eq 0 ]; then
+	echo '- error: unexpected shared/rprivate mount.' >&2
 	exit 1
 fi
+set -e
+# It may happily return 0 here, so need to check if the file still exists.
+$runc exec root umount /rslave/runc
+if [ ! -f "$host/host" ]; then
+	echo '- error: unexpected shared/rslave affecting host.' >&2
+	exit 1
+fi
+$runc exec root umount /rshared/runc
+if [ -f "$host/host" ]; then
+	echo '- error: unexpected shared not affecting host.' >&2
+	exit 1
+fi
+$runc delete -f root
+
+# Test rootfsPropagation==slave which is the default.
+mv config.json config.json.orig
+cat config.json.orig |
+	jq 'del(.linux.rootfsPropagation)' > config.json
+$runc run -d root
+mount -o bind /tmp "$host"
+$runc exec root ls /rshared/runc/host
+$runc exec root ls /rslave/runc/host
+$runc exec root umount /rshared/runc
+if [ ! -f "$host/host" ]; then
+	echo '- error: unexpected slave/rshared affecting host.' >&2
+	exit 1
+fi
+$runc delete -f root
+umount "$host"
+
+# Test rootfsPropagation==private.
+mv config.json config.json.orig
+cat config.json.orig |
+	jq '.linux.rootfsPropagation = "private"' > config.json
+$runc run -d root
+mount -o bind /tmp "$host"
+set +e
+$runc exec root ls /rshared/runc/host
+if [ $? -eq 0 ]; then
+	echo '- error: unexpected private/rshared mount.' >&2
+	exit 1
+fi
+$runc exec root ls /rslave/runc/host
+if [ $? -eq 0 ]; then
+	echo '- error: unexpected private/rslave mount.' >&2
+	exit 1
+fi
+set -e
+$runc delete -f root
+umount "$host"
+umount "$rootfs"
+exit $error
