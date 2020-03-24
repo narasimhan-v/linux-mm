@@ -24,9 +24,14 @@ manifestJson="$(
 		-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
 		"$registryBase/v2/$image/manifests/latest"
 )"
-if [[ "$arch" == 'x86_64' ]]; then
+case "$arch" in
+'x86_64')
 	arch='amd64'
-fi
+	;;
+'aarch64')
+	arch='arm64'
+	;;
+esac
 newlineIFS=$'\n'
 layersFs="$(echo "$manifestJson" |
 	jq --raw-output --compact-output '.manifests[]')"
