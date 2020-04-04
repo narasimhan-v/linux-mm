@@ -252,6 +252,7 @@ if ! [[ "$out" =~ 'Operation not permitted' ]]; then
 	# There is a runtime with seccomp off by default.
 	error=$((error + 1))
 fi
+set -e
 
 # Test rootfsPropagation==shared.
 # Assume the "/"  was mounted as shared.
@@ -337,4 +338,21 @@ set -e
 $runc delete -f root
 umount "$host"
 umount "$rootfs"
+
+# Test rlimits.
+script='
+ulimit -v -H
+ulimit -v -S
+'
+mv config.json config.json.orig
+cat config.json.orig |
+	jq --arg script "$script" \
+	'.process.args = ["sh", "-c", $script] |
+	.process.rlimits |= .+ [{"type":"RLIMIT_AS","hard":10485760,"soft":5242880}]' \
+	> config.json
+out="$($runc run root)"
+if [[ "$out" != 10240$'\n'5120 ]]; then
+	echo "- error: unexpected rlimits output is $out." >&2
+	exit 1
+fi
 exit $error
