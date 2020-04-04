@@ -88,9 +88,9 @@ fi
 set +e
 /opt/ltp/runltp -f syscalls,mm,fs,hugetlb,cpuhotplug
 
-dmesg | grep -i warn | grep -v _NOWARN
-dmesg | grep -i bug | grep -v -i debug
+dmesg | grep -i warn | grep -v _NOWARN | grep -v ?
+dmesg | grep -i bug | grep -v -i debug | grep -v ?
 dmesg | grep -i error
-dmesg | grep -i leak | grep -v kmemleak_alloc
+dmesg | grep -i leak | grep -v kmemleak_
 dmesg | grep -i undefined
 dmesg | grep -i corruption
