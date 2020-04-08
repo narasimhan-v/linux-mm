@@ -40,4 +40,4 @@ EOF
 fi
 /usr/libexec/qemu-kvm -name "$distro" -cpu host -smp 2 -m 2G \
 	-hda "$distro.qcow2" -cdrom "$distro.iso" $bios \
-	-nic user,hostfwd=tcp::2222-:22 -serial mon:stdio
+	-nic user,hostfwd=tcp::2222-:22 -serial mon:stdio -nographic
