@@ -66,6 +66,9 @@ if [ ! -x /opt/ltp/runltp ]; then
 	# This test takes a long time and not worth running.
 	sed -i '/fork13.*/d' /opt/ltp/runtest/syscalls
 
+	# This test is time-consuming and never found a single bug.
+	sed -i '/min_free_kbytes/d' /opt/ltp/runtest/mm
+
 	case "$arch" in
 	's390x' | 'x86_64')
 		# This test sometimes triggers unneeded OOMs.
