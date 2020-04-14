@@ -59,11 +59,11 @@ for i in "${!layers[@]}"; do
 	)"
 	break
 done
-if [ ! -d rootfs ]; then
-	mkdir rootfs
+if [ -d rootfs ]; then
+	rm -r rootfs
 fi
+mkdir rootfs
 cd rootfs
-rm -f layer.tar
 layersFs="$(echo "$submanifestJson" |
 	jq --raw-output --compact-output '.layers[]')"
 IFS="$newlineIFS"
@@ -355,4 +355,50 @@ if [[ "$out" != 10240$'\n'5120 ]]; then
 	echo "- error: unexpected rlimits output is $out." >&2
 	exit 1
 fi
-exit $error
+
+# Run a fuzzer if everything passed.
+if [[ $error -ne 0 ]]; then
+	exit $error
+fi
+if [ ! -d 'trinity' ]; then
+	git clone https://github.com/kernelslacker/trinity.git
+fi
+cpus=$(lscpu | sed -n 's/^CPU(s): *\([0-9]*\)/\1/p')
+if [ ! -x '/usr/bin/trinity' ]; then
+	cd trinity
+	./configure
+	make -j "$cpus"
+	make install
+	cd ..
+fi
+mv config.json config.json.orig
+# Reading of pseudo files have already been tested before, and it is unsafe to
+# write garbage to them. Also, set memory.max to 1G to protect the system from
+# crazy fuzzers which would affect the continuity.
+cat config.json.orig |
+	jq --arg cpus "$cpus" \
+	'del(.linux.seccomp) | del(.process.rlimits) |
+	.process.args = ["trinity", "--dangerous", "-C", $cpus,
+			"--disable-fds=pseudo", "--arch", "64"] |
+	.mounts |= .+ [{"destination":"/usr/bin/trinity",
+			"options":["rbind","ro"],
+			"source":"/usr/bin/trinity",
+			"type":"bind"}] |
+	.linux.cgroupsPath = "/runc" |
+	.linux.resources.memory = {"limit": 1073741824}' \
+	> config.json
+# CAP_SYS_ADMIN is unsafe here. For example, sethostname() would make the life
+# miserable.
+for item in 'bounding' 'effective' 'inheritable' 'permitted'; do
+	mv config.json config.json.orig
+	cat config.json.orig |
+		jq --arg item "$item" \
+		'.process.capabilities[$item] = [
+		"CAP_CHOWN","CAP_IPC_LOCK","CAP_LEASE","CAP_LINUX_IMMUTABLE",
+		"CAP_NET_ADMIN","CAP_NET_RAW","CAP_NET_BIND_SERVICE",
+		"CAP_SETGID","CAP_SETUID", "CAP_SETFCAP","CAP_SETPCAP",
+		"CAP_SYS_NICE","CAP_SYS_PACCT","CAP_SYS_PTRACE","CAP_KILL",
+		"CAP_SYS_RAWIO"]' \
+		> config.json
+done
+$runc run root
