@@ -9,7 +9,7 @@ arch=$(uname -m)
 registryBase='https://registry-1.docker.io'
 authBase='https://auth.docker.io'
 authService='registry.docker.io'
-# Busybox and Alpine has problems with noNewPrivileges.
+# Busybox and Alpine have problems with noNewPrivileges.
 # Fedora, Debian, and CentOS are larger in size.
 # RHEL UBI is not in docker.io and a bit annoying to fetch.
 image='library/ubuntu'
@@ -384,11 +384,12 @@ cat config.json.orig |
 			"options":["rbind","ro"],
 			"source":"/usr/bin/trinity",
 			"type":"bind"}] |
+	.linux.namespaces |= .+ [{"type":"cgroup"}] |
 	.linux.cgroupsPath = "/runc" |
 	.linux.resources.memory = {"limit": 1073741824}' \
 	> config.json
-# CAP_SYS_ADMIN is unsafe here. For example, sethostname() would make the life
-# miserable.
+# CAP_SYS_ADMIN is unsafe here. For example, exceeding resource limits would
+# make the life miserable.
 for item in 'bounding' 'effective' 'inheritable' 'permitted'; do
 	mv config.json config.json.orig
 	cat config.json.orig |
