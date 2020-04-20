@@ -384,7 +384,6 @@ cat config.json.orig |
 			"options":["rbind","ro"],
 			"source":"/usr/bin/trinity",
 			"type":"bind"}] |
-	.linux.namespaces |= .+ [{"type":"cgroup"}] |
 	.linux.cgroupsPath = "/runc" |
 	.linux.resources.memory = {"limit": 1073741824}' \
 	> config.json
