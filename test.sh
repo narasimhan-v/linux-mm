@@ -91,6 +91,9 @@ fi
 set +e
 /opt/ltp/runltp -f syscalls,mm,fs,hugetlb,cpuhotplug
 
+# Test a sysfs write code path.
+echo 1 > /sys/kernel/slab/fs_cache/shrink
+
 dmesg | grep -i warn | grep -v _NOWARN | grep -v ?
 dmesg | grep -i bug | grep -v -i debug | grep -v ?
 dmesg | grep -i error
