@@ -17,6 +17,9 @@ case "$arch" in
 'ppc64le')
 	image="$distro-ppc64el.img"
 	;;
+*)
+	image="$distro-$arch.img"
+	;;
 esac
 if [ ! -f "$distro.qcow2" ]; then
 	if [ ! -f "$image" ]; then
@@ -40,4 +43,4 @@ EOF
 fi
 /usr/libexec/qemu-kvm -name "$distro" -cpu host -smp 2 -m 2G \
 	-hda "$distro.qcow2" -cdrom "$distro.iso" $bios \
-	-nic user,hostfwd=tcp::2222-:22 -serial mon:stdio -nographic
+	-nic user,hostfwd=tcp::2222-:22 -nographic
