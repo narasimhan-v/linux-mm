@@ -2,9 +2,13 @@
 
 set -eux -o pipefail
 
+device=${1:-''}
 arch=$(uname -m)
 distro='ubuntu-18.04-server-cloudimg'
 bios=''
+vfio='/sys/bus/pci/drivers/vfio-pci'
+sysfs="/sys/bus/pci/devices/$device"
+sriov=''
 
 case "$arch" in
 'x86_64')
@@ -41,6 +45,29 @@ EOF
 	genisoimage -output "$distro.iso" -volid cidata -joliet -rock \
 		user-data meta-data
 fi
+if [ -f "$sysfs/reset" ]; then
+	modprobe vfio-pci
+	vendor=$(cat "$sysfs/vendor")
+	devid=$(cat "$sysfs/device")
+	echo "${vendor##0x} ${devid##0x}" > "$vfio/new_id"
+
+	# Save the driver name to restore later if possible.
+	driver=$(readlink "$sysfs/driver")
+	echo "$device" > "$sysfs/driver/unbind"
+	echo "$device" > "$vfio/bind"
+	sriov="-device vfio-pci,host=$device"
+fi
 /usr/libexec/qemu-kvm -name "$distro" -cpu host -smp 2 -m 2G \
 	-hda "$distro.qcow2" -cdrom "$distro.iso" $bios \
-	-nic user,hostfwd=tcp::2222-:22 -nographic
+	-nic user,hostfwd=tcp::2222-:22 -nographic $sriov
+
+if [ -n "$sriov" ]; then
+	echo "${vendor##0x} ${devid##0x}" > "$vfio/remove_id"
+	echo "$device" > "$vfio/unbind"
+
+	# To restore PCI passthrough,
+	# echo "$device" > $driver/bind
+	# To restore SR-IOV,
+	# echo 0 > /sys/class/net/<interface>/device/sriov_numvfs
+	echo "$driver"
+fi
