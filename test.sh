@@ -44,7 +44,7 @@ done
 set -e
 
 if [ ! -d ltp ]; then
-	git clone https://github.com/cailca/ltp.git
+	git clone https://github.com/linux-test-project/ltp.git
 fi
 
 if [ ! -x /opt/ltp/runltp ]; then
