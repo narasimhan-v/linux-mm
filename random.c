@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * random kernel bug collection
+ *
+ * Accept an additional argument to trigger a specific bug by number.
+ * 1: trigger swapping or OOM, and then offline all memory.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,9 +58,9 @@ static FILE *safe_fopen(char *path, const char *mode)
 static void *thread_mmap(void *data)
 {
 	char *ptr;
-	long i;
+	size_t i;
+	size_t length = (size_t)data;
 	int pagesz = getpagesize();
-	long length = (long)data;
 
 	ptr = mmap(NULL, length, PROT_READ | PROT_WRITE,
 		   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -103,7 +106,7 @@ static void alloc_mmap(size_t size)
 	switch(pid = fork()) {
 	case 0:
 		child_mmap(size);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	case -1:
 		perror("fork");
 		return;
@@ -162,27 +165,33 @@ static void hotplug_memory()
 	closedir(dir);
 }
 
-int main()
+int main(int argc, char *argv[])
 {
-	long free_size;
+	size_t free_size;
 	size_t len = 0;
 	FILE *fp = safe_fopen("/proc/meminfo", "r");
 	char *line = NULL;
+	long bug = 0;
+	long select;
 
 	if (!fp)
-		return 1;
+		return EXIT_FAILURE;
 
 	/* MemFree is the second line. */
 	getline(&line, &len, fp);
 	getline(&line, &len, fp);
-	sscanf(line, "%*s%ld%*s", &free_size);
+	sscanf(line, "%*s%zu%*s", &free_size);
 
 	free(line);
 	fclose(fp);
 
-	/* Allocate a bit more to trigger swapping/OOM. */
-	alloc_mmap(free_size * 1024 * 1.2);
-	hotplug_memory();
+	if (argc != 1)
+		select = atol(argv[1]);
 
-	return 0;
+	if (argc == 1 || select == ++bug) {
+		/* Allocate a bit more to trigger swapping or OOM. */
+		alloc_mmap(free_size * 1024 * 1.2);
+		hotplug_memory();
+	}
+	return EXIT_SUCCESS;
 }
