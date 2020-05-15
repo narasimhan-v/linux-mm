@@ -3,36 +3,44 @@
  * random kernel bug collection
  *
  * Accept an additional argument to trigger a specific bug by number.
- * 1: trigger swapping or OOM, and then offline all memory.
+ * 1: trigger swapping/OOM, and then offline all memory.
+ * 2: migrate hugepages while soft offlining, and then offline all memory.
  */
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <limits.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <sys/types.h>
 #include <string.h>
-#include <errno.h>
-#include <ctype.h>
+#include <unistd.h>
 #include <sys/mman.h>
-#include <pthread.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 
 #define THREADS 10
-
-static void *safe_malloc(size_t size)
-{
-	void *ptr = malloc(size);
-
-	if (!ptr)
-		fprintf(stderr, "malloc %zu: %s\n", size, strerror(errno));
-
-	return ptr;
-}
+#define LOOPS 1000
+#define MAXNODE 4096
+#define MADV_SOFT_OFFLINE 101
+#define MPOL_MF_MOVE_ALL (1 << 2)
+#define MPOL_BIND 2
 
 static void print_start(const char *name)
 {
-	printf("start: %s\n", name);
+	printf("- start: %s\n", name);
+}
+
+static void *safe_malloc(size_t length)
+{
+	void *addr = malloc(length);
+
+	if (!addr)
+		fprintf(stderr, "malloc %zu: %s\n", length, strerror(errno));
+
+	return addr;
 }
 
 static DIR *safe_opendir(char *path)
@@ -55,26 +63,240 @@ static FILE *safe_fopen(char *path, const char *mode)
 	return fp;
 }
 
+static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
+		       off_t offset)
+{
+	void *ptr;
+
+	ptr = mmap(addr, length, prot, flags, fd, offset);
+	if (ptr == MAP_FAILED)
+		fprintf(stderr, "mmap %zu: %s\n", length, strerror(errno));
+
+	return ptr;
+}
+
+static int safe_munmap(void *addr, size_t length)
+{
+	if (munmap(addr, length)) {
+		fprintf(stderr, "munmap %zu: %s\n", length, strerror(errno));
+
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+static long safe_mbind(void *addr, unsigned long length, int mode,
+		       const unsigned long *nodemask, unsigned long maxnode,
+		       unsigned flags)
+{
+	if (syscall(__NR_mbind, (long)addr, length, mode, (long)nodemask,
+		    maxnode, flags)) {
+		perror("mbind");
+
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+static int safe_mlock(const void *addr, size_t length)
+{
+	if (mlock(addr, length)) {
+		fprintf(stderr, "munmap %zu: %s\n", length, strerror(errno));
+
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+static size_t get_meminfo(char *field)
+{
+	FILE *fp = safe_fopen("/proc/meminfo", "r");
+	char *line = NULL;
+	char key[100];
+	size_t length = 0;
+	size_t value = -1;
+
+	if (!fp)
+		return -1;
+
+	while (getline(&line, &length, fp) != -1) {
+		sscanf(line, "%s%zu%*s", key, &value);
+		if (!strcmp(field, key))
+			goto out;
+	}
+	fprintf(stderr, "- fail: no %s in meminfo.\n", field);
+out:
+	free(line);
+	fclose(fp);
+
+	return value;
+}
+
+static long set_node_huge(int node, long size, size_t huge_size)
+{
+	FILE *fp;
+	char path[PATH_MAX];
+	char value[100];
+	char *base = "/sys/devices/system/node";
+	long save;
+
+	snprintf(path, sizeof(path),
+		 "%s/node%d/hugepages/hugepages-%zukB/nr_hugepages",
+		 base, node, huge_size);
+	fp = safe_fopen(path, "w+");
+	if (!fp)
+		return -1;
+
+	fread(value, sizeof(value), 1, fp);
+	if (ferror(fp)) {
+		fprintf(stderr, "- fail: fread %s %s\n", path,
+			strerror(errno));
+
+		return -1;
+	}
+	save = atol(value);
+	if (size < 0)
+		goto out;
+
+	snprintf(value, sizeof(value), "%ld", size);
+	if (!fwrite(value, sizeof(value), 1, fp)) {
+		fprintf(stderr, "- fail: fwrite %s %s\n", path,
+			strerror(errno));
+		fclose(fp);
+
+		return -1;
+	}
+out:
+	fclose(fp);
+
+	return save;
+}
+
+static int mmap_offline_node_huge(size_t length)
+{
+	char *addr;
+	int i, code;
+
+	for (i = 0; i < LOOPS; i++) {
+		addr = mmap(NULL, length, PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+		if (addr == MAP_FAILED) {
+			if (i == 0 || errno != ENOMEM) {
+				perror("mmap");
+
+				return EXIT_FAILURE;
+			}
+			usleep(1000);
+			continue;
+		}
+		memset(addr, 0, length);
+
+		code = madvise(addr, length, MADV_SOFT_OFFLINE);
+		if(safe_munmap(addr, length))
+			return EXIT_FAILURE;
+
+		/* madvise() could return >= 0 on success. */
+		if (code < 0 && errno != EBUSY) {
+			perror("madvise");
+
+			return EXIT_FAILURE;
+		}
+	}
+	return EXIT_SUCCESS;
+}
+
+static int loop_move_pages(int node1, int node2, size_t length)
+{
+	int pagesz = getpagesize();
+	int nr_pages = length / pagesz;
+	int i, j;
+	int *nodes = safe_malloc(sizeof(int) * nr_pages);
+	int *status = safe_malloc(sizeof(int) * nr_pages);
+	void **pages = safe_malloc(sizeof(char *) * nr_pages);
+	void *addr;
+	pid_t ppid = getppid();
+
+	if (!pages || !nodes || !status)
+		goto out;
+
+	addr = safe_mmap(NULL, length, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+	if (addr == MAP_FAILED)
+		goto out;
+
+	if (munmap(addr, length))
+		goto out;
+
+	for (i = 0; i < nr_pages; i++)
+		pages[i] = addr + i * pagesz;
+
+	for (i = 0; ; i++) {
+		for (j = 0; j < nr_pages; j++) {
+			nodes[j] = (i % 2) ? node2 : node1;
+			status[j] = 0;
+		}
+		/* move_pages() could return >= 0 on success. */
+		if(syscall(__NR_move_pages, ppid, nr_pages, pages,
+			   nodes, status, MPOL_MF_MOVE_ALL) < 0) {
+			if (errno == ENOMEM)
+				continue;
+			perror("move_pages");
+			goto out;
+		}
+	}
+out:
+	free(pages);
+	free(nodes);
+	free(status);
+
+	return EXIT_FAILURE;
+}
+
+static int mmap_bind_node_huge(int node, size_t length)
+{
+	void *addr;
+	unsigned long mask[MAXNODE] = { 0 };
+
+	printf("- info: mmap and free %zu bytes hugepages on node %d\n",
+	       length, node);
+	addr = safe_mmap(NULL, length, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+	if (addr == MAP_FAILED)
+		return EXIT_FAILURE;
+
+	mask[0] = 1 << node;
+	if (safe_mbind(addr, length, MPOL_BIND, mask, MAXNODE, 0))
+		return EXIT_FAILURE;
+
+	if (safe_mlock(addr, length))
+		return EXIT_FAILURE;
+
+	if (safe_munmap(addr, length))
+		return EXIT_FAILURE;
+
+	return EXIT_SUCCESS;
+}
+
 static void *thread_mmap(void *data)
 {
-	char *ptr;
+	char *addr;
 	size_t i;
 	size_t length = (size_t)data;
-	int pagesz = getpagesize();
 
-	ptr = mmap(NULL, length, PROT_READ | PROT_WRITE,
+	addr = mmap(NULL, length, PROT_READ | PROT_WRITE,
 		   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-	if (ptr == MAP_FAILED) {
+	if (addr == MAP_FAILED) {
 		perror("mmap");
+
 		return NULL;
 	}
-	for (i = 0; i < length; i += pagesz)
-		ptr[i] = '\a';
+	for (i = 0; i < length; i += getpagesize())
+		addr[i] = '\a';
 
 	return NULL;
 }
 
-static void child_mmap(size_t size)
+static void loop_mmap(size_t length)
 {
 	pthread_t *thread;
 	int i;
@@ -84,11 +306,10 @@ static void child_mmap(size_t size)
 		return;
 
 	for (i = 0; i < THREADS; i++) {
-		printf("info: mmap %d%% memory: %zu\n", THREADS,
-		       size / THREADS);
-
+		printf("- info: mmap %d%% memory: %zu\n", THREADS,
+		       length / THREADS);
 		if (pthread_create(&thread[i], NULL, thread_mmap,
-				   (void *)(size / THREADS)))
+				   (void *)(length / THREADS)))
 			perror("pthread_create");
 	}
 	for (i = 0; i < THREADS; i++)
@@ -98,26 +319,30 @@ static void child_mmap(size_t size)
 }
 
 /* Allocate memory and mmap them. */
-static void alloc_mmap(size_t size)
+static int alloc_mmap(size_t length)
 {
 	pid_t pid;
 
 	print_start(__func__);
 	switch(pid = fork()) {
 	case 0:
-		child_mmap(size);
+		loop_mmap(length * 1024);
+
 		exit(EXIT_SUCCESS);
 	case -1:
-		perror("fork");
-		return;
+		perror("- fail: fork");
+
+		return EXIT_FAILURE;
 	default:
 		break;
 	}
 	wait(NULL);
+
+	return EXIT_SUCCESS;
 }
 
 /* Offline and online all memory. */
-static void hotplug_memory()
+static int hotplug_memory()
 {
 	char *base = "/sys/devices/system/memory";
 	char path[PATH_MAX];
@@ -127,7 +352,7 @@ static void hotplug_memory()
 	print_start(__func__);
 	dir = safe_opendir(base);
 	if (!dir)
-		return;
+		return EXIT_FAILURE;
 
 	while ((memory = readdir(dir))) {
 		struct dirent *final;
@@ -138,21 +363,22 @@ static void hotplug_memory()
 			continue;
 		if (memory->d_type != DT_DIR)
 			continue;
-		snprintf(path, PATH_MAX, "%s/%s", base, memory->d_name);
+		snprintf(path, sizeof(path), "%s/%s", base, memory->d_name);
 		section = safe_opendir(path);
 		if (!section)
-			return;
+			return EXIT_FAILURE;
 
 		while ((final = readdir(section))) {
 			FILE *fp;
 
 			if (!strcmp (final->d_name, "state"))
 				continue;
-			snprintf(path, PATH_MAX, "%s/%s/state", base,
+			snprintf(path, sizeof(path), "%s/%s/state", base,
 				 memory->d_name);
 			fp = fopen(path, "w+");
 			if (!fp)
 				continue;
+
 			if (fwrite("offline", 8, 1, fp)) {
 				fflush(fp);
 				fwrite("online", 7, 1, fp);
@@ -163,35 +389,126 @@ static void hotplug_memory()
 		closedir(section);
 	}
 	closedir(dir);
+
+	return EXIT_SUCCESS;
+}
+
+/* Migrate hugepages while soft offlining. */
+static int migrate_huge_offline(size_t free_size)
+{
+	FILE *fp;
+	char *line = NULL;
+	size_t length = 0;
+	size_t huge_size;
+	int node1 = -1;
+	int node2 = -1;
+	long save1, save2;
+	int code = EXIT_SUCCESS;
+	pid_t pid;
+
+	print_start(__func__);
+	fp = safe_fopen("/sys/devices/system/node/has_memory", "r");
+	if (!fp)
+		return EXIT_FAILURE;
+
+	getline(&line, &length, fp);
+	sscanf(line, "%d%*c%d", &node1, &node2);
+	free(line);
+	fclose(fp);
+
+	if (node1 == -1 || node2 == -1) {
+		printf("- fail: it requires 2 NUMA nodes.\n");
+
+		return EXIT_FAILURE;
+	}
+	printf("- info: use NUMA nodes %d,%d.\n", node1, node2);
+	huge_size = get_meminfo("Hugepagesize:");
+	if (huge_size < 0)
+		return EXIT_FAILURE;
+
+	/* 4 pages are required to trigger the bug. */
+	if (8 * huge_size > free_size) {
+		fprintf(stderr,
+			"- fail: not enough memory for 8 hugepages.\n");
+
+		return EXIT_FAILURE;
+	}
+	save1 = set_node_huge(node1, -1, huge_size);
+	if (save1 < 0)
+		return EXIT_FAILURE;
+
+	save2 = set_node_huge(node2, -1, huge_size);
+	if (save2 < 0)
+		return EXIT_FAILURE;
+
+	if (set_node_huge(node1, save1 + 4, huge_size) < 0)
+		return EXIT_FAILURE;
+
+	if (set_node_huge(node2, save2 + 4, huge_size) < 0)
+		return EXIT_FAILURE;
+
+	length = 4 * huge_size * 1024;
+	if (mmap_bind_node_huge(node1, length))
+		return EXIT_FAILURE;
+
+	if (mmap_bind_node_huge(node2, length))
+		return EXIT_FAILURE;
+
+	length = 2 * huge_size * 1024;
+
+	switch(pid = fork()) {
+	case 0:
+		exit(loop_move_pages(node1, node2, length));
+	case -1:
+		perror("- fail: fork");
+
+		return EXIT_FAILURE;
+	default:
+		break;
+	}
+	if (mmap_offline_node_huge(length))
+		code = EXIT_FAILURE;
+
+	if (kill(pid, SIGKILL)) {
+		perror("kill");
+		code = EXIT_FAILURE;
+	} else {
+		wait(NULL);
+	}
+	if (set_node_huge(node1, save1, huge_size) < 0)
+		code = EXIT_FAILURE;
+
+	if (set_node_huge(node2, save2, huge_size) < 0)
+		code = EXIT_FAILURE;
+
+	return code;
 }
 
 int main(int argc, char *argv[])
 {
 	size_t free_size;
-	size_t len = 0;
-	FILE *fp = safe_fopen("/proc/meminfo", "r");
-	char *line = NULL;
 	long bug = 0;
 	long select;
-
-	if (!fp)
-		return EXIT_FAILURE;
-
-	/* MemFree is the second line. */
-	getline(&line, &len, fp);
-	getline(&line, &len, fp);
-	sscanf(line, "%*s%zu%*s", &free_size);
-
-	free(line);
-	fclose(fp);
+	long code = 0;
 
 	if (argc != 1)
 		select = atol(argv[1]);
+	free_size = get_meminfo("MemFree:");
+	if (free_size < 0)
+		return EXIT_FAILURE;
 
 	if (argc == 1 || select == ++bug) {
-		/* Allocate a bit more to trigger swapping or OOM. */
-		alloc_mmap(free_size * 1024 * 1.2);
-		hotplug_memory();
+		/* Allocate a bit more to trigger swapping/OOM. */
+		code += alloc_mmap(free_size * 1.2);
+		code += hotplug_memory();
+		if (argc != 1)
+			return code;
 	}
-	return EXIT_SUCCESS;
+	if (argc == 1 || select == ++bug) {
+		code += migrate_huge_offline(free_size);
+		code += hotplug_memory();
+		if (argc != 1)
+			return code;
+	}
+	return code;
 }
