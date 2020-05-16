@@ -5,6 +5,7 @@
  * Accept an additional argument to trigger a specific bug by number.
  * 1: trigger swapping/OOM, and then offline all memory.
  * 2: migrate hugepages while soft offlining, and then offline all memory.
+ * 3: migrate KSM pages repetitively.
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -21,12 +22,13 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
-#define THREADS 10
-#define LOOPS 1000
-#define MAXNODE 4096
 #define MADV_SOFT_OFFLINE 101
-#define MPOL_MF_MOVE_ALL (1 << 2)
 #define MPOL_BIND 2
+#define MPOL_MF_MOVE_ALL (1 << 2)
+#define NR_LOOP 1000
+#define NR_NODE 4096
+#define NR_PAGE 20
+#define NR_THREAD 10
 
 static void print_start(const char *name)
 {
@@ -108,6 +110,42 @@ static int safe_mlock(const void *addr, size_t length)
 	return EXIT_SUCCESS;
 }
 
+static long safe_migrate_pages(int pid, unsigned long max_node,
+			       const unsigned long *old_nodes,
+			       const unsigned long *new_nodes)
+{
+	if (syscall(__NR_migrate_pages, pid, max_node, old_nodes,
+		    new_nodes) < 0) {
+		perror("migrate_pages");
+
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+static int safe_fread(void *ptr, size_t size, size_t item, FILE *fp)
+{
+	fread(ptr, sizeof(ptr), item, fp);
+	if (ferror(fp)) {
+		perror("fread");
+		fclose(fp);
+
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+static int safe_fwrite(void *ptr, size_t size, size_t item, FILE *fp)
+{
+	if (!fwrite(ptr, size, item, fp)) {
+		perror("fwrite");
+		fclose(fp);
+
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
 static size_t get_meminfo(char *field)
 {
 	FILE *fp = safe_fopen("/proc/meminfo", "r");
@@ -147,25 +185,16 @@ static long set_node_huge(int node, long size, size_t huge_size)
 	if (!fp)
 		return -1;
 
-	fread(value, sizeof(value), 1, fp);
-	if (ferror(fp)) {
-		fprintf(stderr, "- fail: fread %s %s\n", path,
-			strerror(errno));
-
+	if (safe_fread(value, sizeof(value), 1, fp))
 		return -1;
-	}
+
 	save = atol(value);
 	if (size < 0)
 		goto out;
 
 	snprintf(value, sizeof(value), "%ld", size);
-	if (!fwrite(value, sizeof(value), 1, fp)) {
-		fprintf(stderr, "- fail: fwrite %s %s\n", path,
-			strerror(errno));
-		fclose(fp);
-
+	if (safe_fwrite(value, sizeof(value), 1, fp))
 		return -1;
-	}
 out:
 	fclose(fp);
 
@@ -177,7 +206,7 @@ static int mmap_offline_node_huge(size_t length)
 	char *addr;
 	int i, code;
 
-	for (i = 0; i < LOOPS; i++) {
+	for (i = 0; i < NR_LOOP; i++) {
 		addr = mmap(NULL, length, PROT_READ | PROT_WRITE,
 			   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
 		if (addr == MAP_FAILED) {
@@ -202,6 +231,7 @@ static int mmap_offline_node_huge(size_t length)
 			return EXIT_FAILURE;
 		}
 	}
+	printf("- pass: %s\n", __func__);
 	return EXIT_SUCCESS;
 }
 
@@ -255,7 +285,7 @@ out:
 static int mmap_bind_node_huge(int node, size_t length)
 {
 	void *addr;
-	unsigned long mask[MAXNODE] = { 0 };
+	unsigned long mask[NR_NODE] = { 0 };
 
 	printf("- info: mmap and free %zu bytes hugepages on node %d\n",
 	       length, node);
@@ -265,7 +295,7 @@ static int mmap_bind_node_huge(int node, size_t length)
 		return EXIT_FAILURE;
 
 	mask[0] = 1 << node;
-	if (safe_mbind(addr, length, MPOL_BIND, mask, MAXNODE, 0))
+	if (safe_mbind(addr, length, MPOL_BIND, mask, NR_NODE, 0))
 		return EXIT_FAILURE;
 
 	if (safe_mlock(addr, length))
@@ -275,6 +305,127 @@ static int mmap_bind_node_huge(int node, size_t length)
 		return EXIT_FAILURE;
 
 	return EXIT_SUCCESS;
+}
+
+static int get_numa(int *node1, int *node2)
+{
+	char *line = NULL;
+	size_t length = 0;
+	FILE *fp;
+
+	fp = safe_fopen("/sys/devices/system/node/has_memory", "r");
+	if (!fp) {
+		fprintf(stderr, "- fail: it requires NUMA nodes.\n");
+
+		return EXIT_FAILURE;
+	}
+	*node1 = -1;
+	*node2 = -1;
+	getline(&line, &length, fp);
+	sscanf(line, "%d%*c%d", node1, node2);
+	free(line);
+	fclose(fp);
+
+	if (*node1 == -1 || *node2 == -1) {
+		fprintf(stderr, "- fail: it requires 2 NUMA nodes.\n");
+
+		return EXIT_FAILURE;
+	}
+	printf("- info: use NUMA nodes %d,%d.\n", *node1, *node2);
+
+	return EXIT_SUCCESS;
+}
+
+static long read_value(char *path)
+{
+	FILE *fp = safe_fopen(path, "r");
+	char value[100];
+
+	if (!fp)
+		return -1;
+
+	if (safe_fread(value, sizeof(value), 1, fp)) {
+		fclose(fp);
+
+		return -1;
+	}
+	fclose(fp);
+
+	return atol(value);
+}
+
+static int write_value(char *path, long value)
+{
+	FILE *fp = safe_fopen(path, "w");
+	char s[100];
+
+	if (!fp)
+		return -1;
+
+	snprintf(s, sizeof(s), "%ld", value);
+	if (safe_fwrite(s, sizeof(s), 1, fp)) {
+		fclose(fp);
+
+		return EXIT_FAILURE;
+	}
+	fclose(fp);
+
+	return EXIT_SUCCESS;
+}
+
+static int scan_ksm()
+{
+	long scans, full_scans;
+	int count = 0;
+	int run;
+	char *base = "/sys/kernel/mm/ksm";
+	char path[PATH_MAX];
+	char value[100];
+	FILE *fp;
+
+	snprintf(path, sizeof(path), "%s/run", base);
+	fp = safe_fopen(path, "w+");
+	if (!fp)
+		return -1;
+
+	if (safe_fread(value, sizeof(value), 1, fp))
+		return -1;
+
+	run = atoi(value);
+	if (run != 1 && safe_fwrite("1", 2, 1, fp))
+		return -1;
+
+	fclose(fp);
+	snprintf(path, sizeof(path), "%s/full_scans", base);
+	scans = read_value(path);
+	if (scans < 0)
+		goto out;
+	/*
+	 * The current scan is already in progress so we can't guarantee that
+	 * the get_user_pages() is called on every existing rmap_item if we
+	 * only waited for the remaining part of the scan.
+	 *
+	 * The actual merging happens after the unstable tree has been built so
+	 * we need to wait at least two full scans to guarantee merging, hence
+	 * wait full_scans to increment by 3 so that at least two full scans
+	 * will run.
+	 */
+	full_scans = scans + 3;
+	while (scans < full_scans) {
+		sleep(1);
+		count++;
+		scans = read_value(path);
+		if (scans < 0)
+			goto out;
+	}
+	printf("- info: KSM takes %ds to run two full scans.\n", count);
+
+	return run;
+out:
+	snprintf(value, sizeof(value), "%d", run);
+	safe_fwrite(value, sizeof(value), 1, fp);
+
+	return -1;
 }
 
 static void *thread_mmap(void *data)
@@ -300,19 +451,20 @@ static void loop_mmap(size_t length)
 {
 	pthread_t *thread;
 	int i;
+	size_t size = length / NR_THREAD;
 
-	thread = safe_malloc(sizeof(pthread_t) * THREADS);
+	thread = safe_malloc(sizeof(pthread_t) * NR_THREAD);
 	if (!thread)
 		return;
 
-	for (i = 0; i < THREADS; i++) {
-		printf("- info: mmap %d%% memory: %zu\n", THREADS,
-		       length / THREADS);
+	for (i = 0; i < NR_THREAD; i++) {
+		printf("- info: mmap %d%% memory: %zu\n", 100 / NR_THREAD,
+		       size);
 		if (pthread_create(&thread[i], NULL, thread_mmap,
-				   (void *)(length / THREADS)))
+				   (void *)size))
 			perror("pthread_create");
 	}
-	for (i = 0; i < THREADS; i++)
+	for (i = 0; i < NR_THREAD; i++)
 		pthread_join(thread[i], NULL);
 
 	free(thread);
@@ -365,9 +517,11 @@ static int hotplug_memory()
 			continue;
 		snprintf(path, sizeof(path), "%s/%s", base, memory->d_name);
 		section = safe_opendir(path);
-		if (!section)
-			return EXIT_FAILURE;
+		if (!section) {
+			closedir(dir);
 
+			return EXIT_FAILURE;
+		}
 		while ((final = readdir(section))) {
 			FILE *fp;
 
@@ -379,9 +533,15 @@ static int hotplug_memory()
 			if (!fp)
 				continue;
 
-			if (fwrite("offline", 8, 1, fp)) {
+			if (safe_fwrite("offline", 8, 1, fp)) {
 				fflush(fp);
-				fwrite("online", 7, 1, fp);
+				if (safe_fwrite("online", 7, 1, fp)) {
+					fclose(fp);
+					closedir(section);
+					closedir(dir);
+
+					return EXIT_FAILURE;
+				}
 			}
 			fclose(fp);
 			break;
@@ -396,32 +556,16 @@ static int hotplug_memory()
 /* Migrate hugepages while soft offlining. */
 static int migrate_huge_offline(size_t free_size)
 {
-	FILE *fp;
-	char *line = NULL;
-	size_t length = 0;
-	size_t huge_size;
-	int node1 = -1;
-	int node2 = -1;
-	long save1, save2;
+	size_t huge_size, length;
+	int node1, node2, status;
 	int code = EXIT_SUCCESS;
+	long save1, save2;
 	pid_t pid;
 
 	print_start(__func__);
-	fp = safe_fopen("/sys/devices/system/node/has_memory", "r");
-	if (!fp)
+	if (get_numa(&node1, &node2))
 		return EXIT_FAILURE;
 
-	getline(&line, &length, fp);
-	sscanf(line, "%d%*c%d", &node1, &node2);
-	free(line);
-	fclose(fp);
-
-	if (node1 == -1 || node2 == -1) {
-		printf("- fail: it requires 2 NUMA nodes.\n");
-
-		return EXIT_FAILURE;
-	}
-	printf("- info: use NUMA nodes %d,%d.\n", node1, node2);
 	huge_size = get_meminfo("Hugepagesize:");
 	if (huge_size < 0)
 		return EXIT_FAILURE;
@@ -468,20 +612,92 @@ static int migrate_huge_offline(size_t free_size)
 	}
 	if (mmap_offline_node_huge(length))
 		code = EXIT_FAILURE;
-
 	if (kill(pid, SIGKILL)) {
 		perror("kill");
 		code = EXIT_FAILURE;
-	} else {
-		wait(NULL);
 	}
+	if (waitpid(pid, &status, 0) < 0) {
+		perror("waitpid");
+		code = EXIT_FAILURE;
+	}
+	if (WIFEXITED(status))
+		code = EXIT_FAILURE;
 	if (set_node_huge(node1, save1, huge_size) < 0)
 		code = EXIT_FAILURE;
-
 	if (set_node_huge(node2, save2, huge_size) < 0)
 		code = EXIT_FAILURE;
 
 	return code;
+}
+
+/* Migrate KSM pages repetitively. */
+static int migrate_ksm()
+{
+	int node1, node2, i, j, m;
+	int pagesz = getpagesize();
+	long run;
+	void *pages[NR_PAGE];
+	unsigned long mask1[NR_NODE] = { 0 };
+	unsigned long mask2[NR_NODE] = { 0 };
+
+	print_start(__func__);
+	if (get_numa(&node1, &node2))
+		return EXIT_FAILURE;
+
+	for (i = 0; i < NR_PAGE; i++)
+	{
+		pages[i] = safe_mmap(NULL, pagesz, PROT_READ | PROT_WRITE |
+				     PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
+				     -1, 0);
+		if (!pages[i])
+			goto out;
+
+		if (madvise(pages[i], pagesz, MADV_MERGEABLE) < 0) {
+			perror("madvise");
+			goto out;
+		}
+		mask1[0] = 1 << node1;
+		if (safe_mbind(pages[i], pagesz, MPOL_BIND, mask1, NR_NODE, 0))
+			goto out;
+
+		memset(pages[i], 0, pagesz);
+	}
+	run = scan_ksm();
+	if (run < 0)
+		goto out;
+
+	printf("- info: call migrate_pages() repetitively.\n");
+	for (m = 0; m < NR_LOOP; m++) {
+		int n = m % 2;
+
+		if (n) {
+			mask1[0] = 1 << node2;
+			mask2[0] = 1 << node1;
+		} else {
+			mask1[0] = 1 << node1;
+			mask2[0] = 1 << node2;
+		}
+		if (safe_migrate_pages(0, NR_NODE, mask1, mask2))
+			goto out;
+	}
+	for (i = 0; i < NR_PAGE; i++)
+		safe_munmap(pages[i], pagesz);
+
+	if (run == 1)
+		goto pass;
+
+	/* Restore. */
+	if (write_value("/sys/kernel/mm/ksm/run", run))
+		return EXIT_FAILURE;
+pass:
+	printf("- pass: %s\n", __func__);
+
+	return EXIT_SUCCESS;
+out:
+	for (j = 0; j < i; j++)
+		safe_munmap(pages[j], pagesz);
+
+	return EXIT_FAILURE;
 }
 
 int main(int argc, char *argv[])
@@ -507,6 +723,11 @@ int main(int argc, char *argv[])
 	if (argc == 1 || select == ++bug) {
 		code += migrate_huge_offline(free_size);
 		code += hotplug_memory();
+		if (argc != 1)
+			return code;
+	}
+	if (argc == 1 || select == ++bug) {
+		code += migrate_ksm();
 		if (argc != 1)
 			return code;
 	}
