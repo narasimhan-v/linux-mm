@@ -30,6 +30,15 @@
 #define NR_PAGE 20
 #define NR_THREAD 10
 
+#define TRIGGER(BUG) \
+	do { \
+		if (argc == 1 || select == ++bug) { \
+			BUG; \
+			if (argc != 1) \
+				return code; \
+		} \
+	} while (0)
+
 static void print_start(const char *name)
 {
 	printf("- start: %s\n", name);
@@ -41,7 +50,6 @@ static void *safe_malloc(size_t length)
 
 	if (!addr)
 		fprintf(stderr, "malloc %zu: %s\n", length, strerror(errno));
-
 	return addr;
 }
 
@@ -51,7 +59,6 @@ static DIR *safe_opendir(char *path)
 
 	if (!dir)
 		fprintf(stderr, "opendir %s: %s\n", path, strerror(errno));
-
 	return dir;
 }
 
@@ -61,7 +68,6 @@ static FILE *safe_fopen(char *path, const char *mode)
 
 	if (!fp)
 		fprintf(stderr, "fopen %s: %s\n", path, strerror(errno));
-
 	return fp;
 }
 
@@ -73,7 +79,6 @@ static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
 	ptr = mmap(addr, length, prot, flags, fd, offset);
 	if (ptr == MAP_FAILED)
 		fprintf(stderr, "mmap %zu: %s\n", length, strerror(errno));
-
 	return ptr;
 }
 
@@ -81,7 +86,6 @@ static int safe_munmap(void *addr, size_t length)
 {
 	if (munmap(addr, length)) {
 		fprintf(stderr, "munmap %zu: %s\n", length, strerror(errno));
-
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -94,7 +98,6 @@ static long safe_mbind(void *addr, unsigned long length, int mode,
 	if (syscall(__NR_mbind, (long)addr, length, mode, (long)nodemask,
 		    maxnode, flags)) {
 		perror("mbind");
-
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -104,7 +107,6 @@ static int safe_mlock(const void *addr, size_t length)
 {
 	if (mlock(addr, length)) {
 		fprintf(stderr, "munmap %zu: %s\n", length, strerror(errno));
-
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -117,7 +119,6 @@ static long safe_migrate_pages(int pid, unsigned long max_node,
 	if (syscall(__NR_migrate_pages, pid, max_node, old_nodes,
 		    new_nodes) < 0) {
 		perror("migrate_pages");
-
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -129,7 +130,6 @@ static int safe_fread(void *ptr, size_t size, size_t item, FILE *fp)
 	if (ferror(fp)) {
 		perror("fread");
 		fclose(fp);
-
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -140,7 +140,6 @@ static int safe_fwrite(void *ptr, size_t size, size_t item, FILE *fp)
 	if (!fwrite(ptr, size, item, fp)) {
 		perror("fwrite");
 		fclose(fp);
-
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -197,7 +196,6 @@ static long set_node_huge(int node, long size, size_t huge_size)
 		return -1;
 out:
 	fclose(fp);
-
 	return save;
 }
 
@@ -212,7 +210,6 @@ static int mmap_offline_node_huge(size_t length)
 		if (addr == MAP_FAILED) {
 			if (i == 0 || errno != ENOMEM) {
 				perror("mmap");
-
 				return EXIT_FAILURE;
 			}
 			usleep(1000);
@@ -227,7 +224,6 @@ static int mmap_offline_node_huge(size_t length)
 		/* madvise() could return >= 0 on success. */
 		if (code < 0 && errno != EBUSY) {
 			perror("madvise");
-
 			return EXIT_FAILURE;
 		}
 	}
@@ -278,7 +274,6 @@ out:
 	free(pages);
 	free(nodes);
 	free(status);
-
 	return EXIT_FAILURE;
 }
 
@@ -316,7 +311,6 @@ static int get_numa(int *node1, int *node2)
 	fp = safe_fopen("/sys/devices/system/node/has_memory", "r");
 	if (!fp) {
 		fprintf(stderr, "- fail: it requires NUMA nodes.\n");
-
 		return EXIT_FAILURE;
 	}
 	*node1 = -1;
@@ -328,11 +322,9 @@ static int get_numa(int *node1, int *node2)
 
 	if (*node1 == -1 || *node2 == -1) {
 		fprintf(stderr, "- fail: it requires 2 NUMA nodes.\n");
-
 		return EXIT_FAILURE;
 	}
 	printf("- info: use NUMA nodes %d,%d.\n", *node1, *node2);
-
 	return EXIT_SUCCESS;
 }
 
@@ -346,11 +338,9 @@ static long read_value(char *path)
 
 	if (safe_fread(value, sizeof(value), 1, fp)) {
 		fclose(fp);
-
 		return -1;
 	}
 	fclose(fp);
-
 	return atol(value);
 }
 
@@ -365,11 +355,9 @@ static int write_value(char *path, long value)
 	snprintf(s, sizeof(s), "%ld", value);
 	if (safe_fwrite(s, sizeof(s), 1, fp)) {
 		fclose(fp);
-
 		return EXIT_FAILURE;
 	}
 	fclose(fp);
-
 	return EXIT_SUCCESS;
 }
 
@@ -419,12 +407,10 @@ static int scan_ksm()
 			goto out;
 	}
 	printf("- info: KSM takes %ds to run two full scans.\n", count);
-
 	return run;
 out:
 	snprintf(value, sizeof(value), "%d", run);
 	safe_fwrite(value, sizeof(value), 1, fp);
-
 	return -1;
 }
 
@@ -438,7 +424,6 @@ static void *thread_mmap(void *data)
 		   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 	if (addr == MAP_FAILED) {
 		perror("mmap");
-
 		return NULL;
 	}
 	for (i = 0; i < length; i += getpagesize())
@@ -479,17 +464,14 @@ static int alloc_mmap(size_t length)
 	switch(pid = fork()) {
 	case 0:
 		loop_mmap(length * 1024);
-
 		exit(EXIT_SUCCESS);
 	case -1:
 		perror("- fail: fork");
-
 		return EXIT_FAILURE;
 	default:
 		break;
 	}
 	wait(NULL);
-
 	return EXIT_SUCCESS;
 }
 
@@ -519,7 +501,6 @@ static int hotplug_memory()
 		section = safe_opendir(path);
 		if (!section) {
 			closedir(dir);
-
 			return EXIT_FAILURE;
 		}
 		while ((final = readdir(section))) {
@@ -539,7 +520,6 @@ static int hotplug_memory()
 					fclose(fp);
 					closedir(section);
 					closedir(dir);
-
 					return EXIT_FAILURE;
 				}
 			}
@@ -549,7 +529,7 @@ static int hotplug_memory()
 		closedir(section);
 	}
 	closedir(dir);
-
+	printf("- pass: %s\n", __func__);
 	return EXIT_SUCCESS;
 }
 
@@ -574,7 +554,6 @@ static int migrate_huge_offline(size_t free_size)
 	if (8 * huge_size > free_size) {
 		fprintf(stderr,
 			"- fail: not enough memory for 8 hugepages.\n");
-
 		return EXIT_FAILURE;
 	}
 	save1 = set_node_huge(node1, -1, huge_size);
@@ -599,7 +578,6 @@ static int migrate_huge_offline(size_t free_size)
 		return EXIT_FAILURE;
 
 	length = 2 * huge_size * 1024;
-
 	switch(pid = fork()) {
 	case 0:
 		exit(loop_move_pages(node1, node2, length));
@@ -626,7 +604,6 @@ static int migrate_huge_offline(size_t free_size)
 		code = EXIT_FAILURE;
 	if (set_node_huge(node2, save2, huge_size) < 0)
 		code = EXIT_FAILURE;
-
 	return code;
 }
 
@@ -691,12 +668,10 @@ static int migrate_ksm()
 		return EXIT_FAILURE;
 pass:
 	printf("- pass: %s\n", __func__);
-
 	return EXIT_SUCCESS;
 out:
 	for (j = 0; j < i; j++)
 		safe_munmap(pages[j], pagesz);
-
 	return EXIT_FAILURE;
 }
 
@@ -713,23 +688,11 @@ int main(int argc, char *argv[])
 	if (free_size < 0)
 		return EXIT_FAILURE;
 
-	if (argc == 1 || select == ++bug) {
-		/* Allocate a bit more to trigger swapping/OOM. */
-		code += alloc_mmap(free_size * 1.2);
-		code += hotplug_memory();
-		if (argc != 1)
-			return code;
-	}
-	if (argc == 1 || select == ++bug) {
-		code += migrate_huge_offline(free_size);
-		code += hotplug_memory();
-		if (argc != 1)
-			return code;
-	}
-	if (argc == 1 || select == ++bug) {
-		code += migrate_ksm();
-		if (argc != 1)
-			return code;
-	}
+	/* Allocate a bit more to trigger swapping/OOM. */
+	TRIGGER(code += alloc_mmap(free_size * 1.2);
+		code += hotplug_memory());
+	TRIGGER(code += migrate_huge_offline(free_size);
+		code += hotplug_memory());
+	TRIGGER(code += migrate_ksm());
 	return code;
 }
