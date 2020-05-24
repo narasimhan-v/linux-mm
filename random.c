@@ -6,18 +6,22 @@
  * 1: trigger swapping/OOM, and then offline all memory.
  * 2: migrate hugepages while soft offlining, and then offline all memory.
  * 3: migrate KSM pages repetitively.
+ * 4. read all debugfs files.
  */
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -143,6 +147,35 @@ static int safe_fwrite(void *ptr, size_t size, size_t item, FILE *fp)
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
+}
+
+static int safe_lstat(const char *path, struct stat *stat)
+{
+	if (lstat(path, stat)) {
+		fprintf(stderr, "lstat %s: %s\n", path, strerror(errno));
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+static int safe_open(const char *path, int flags)
+{
+	int fd = open(path, flags);
+
+	if (fd < 0)
+		fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+	return fd;
+}
+
+static FILE *safe_fdopen(int fd, const char *mode)
+{
+	FILE *fp = fdopen(fd, mode);
+
+	if (!fp) {
+		perror("fdopen");
+		close(fd);
+	}
+	return fp;
 }
 
 static size_t get_meminfo(char *field)
@@ -328,19 +361,34 @@ static int get_numa(int *node1, int *node2)
 	return EXIT_SUCCESS;
 }
 
-static long read_value(char *path)
+static int read_file(char *path, char *buf)
 {
-	FILE *fp = safe_fopen(path, "r");
-	char value[100];
+	int fd = safe_open(path, O_RDONLY | O_NONBLOCK);
+	FILE *fp;
 
+	if (fd < 0)
+		return EXIT_FAILURE;
+
+	fp = safe_fdopen(fd, "r");
 	if (!fp)
-		return -1;
+		return EXIT_FAILURE;
 
-	if (safe_fread(value, sizeof(value), 1, fp)) {
-		fclose(fp);
-		return -1;
+	if (safe_fread(buf, sizeof(buf), 1, fp)) {
+		close(fd);
+		return EXIT_FAILURE;
 	}
 	fclose(fp);
+	close(fd);
+	return EXIT_SUCCESS;
+}
+
+static long read_value(char *path)
+{
+	char value[1024];
+
+	if (read_file(path, value))
+		return -1;
+
 	return atol(value);
 }
 
@@ -675,6 +723,61 @@ out:
 	return EXIT_FAILURE;
 }
 
+static int read_all(char *path, bool is_top)
+{
+	DIR *dir = safe_opendir(path);
+	struct dirent *entry;
+	struct stat dent_st;
+	char subpath[PATH_MAX];
+	char buf[1024];
+
+	if (is_top) {
+		snprintf(buf, sizeof(buf), "%s %s", __func__, path);
+		print_start(buf);
+	}
+	if (!dir)
+		return EXIT_FAILURE;
+
+	while ((entry = readdir(dir))) {
+		if (!strcmp (entry->d_name, "."))
+			continue;
+		if (!strcmp (entry->d_name, ".."))
+			continue;
+		snprintf(subpath, sizeof(subpath), "%s/%s", path,
+			 entry->d_name);
+
+		switch(entry->d_type) {
+		case DT_DIR:
+			read_all(subpath, false);
+			break;
+		case DT_LNK:
+			continue;
+		case DT_UNKNOWN:
+			if (safe_lstat(subpath, &dent_st)) {
+				closedir(dir);
+				return EXIT_FAILURE;
+			}
+			switch(dent_st.st_mode & S_IFMT) {
+			case S_IFDIR:
+				read_all(subpath, false);
+				break;
+			case S_IFLNK:
+				continue;
+			default:
+				read_file(subpath, buf);
+			}
+			break;
+		default:
+			read_file(subpath, buf);
+		}
+	}
+	closedir(dir);
+	if (is_top)
+		printf("- pass: %s\n", __func__);
+
+	return EXIT_SUCCESS;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size;
@@ -694,5 +797,6 @@ int main(int argc, char *argv[])
 	TRIGGER(code += migrate_huge_offline(free_size);
 		code += hotplug_memory());
 	TRIGGER(code += migrate_ksm());
+	TRIGGER(code += read_all("/sys/kernel/debug", true));
 	return code;
 }
