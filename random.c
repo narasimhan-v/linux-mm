@@ -6,7 +6,7 @@
  * 1: trigger swapping/OOM, and then offline all memory.
  * 2: migrate hugepages while soft offlining, and then offline all memory.
  * 3: migrate KSM pages repetitively.
- * 4. read all debugfs files.
+ * 4: read all debugfs files.
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -88,74 +88,62 @@ static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
 
 static int safe_munmap(void *addr, size_t length)
 {
-	if (munmap(addr, length)) {
+	int code = munmap(addr, length);
+
+	if (code)
 		fprintf(stderr, "munmap %zu: %s\n", length, strerror(errno));
-		return EXIT_FAILURE;
-	}
-	return EXIT_SUCCESS;
+	return code;
 }
 
 static long safe_mbind(void *addr, unsigned long length, int mode,
 		       const unsigned long *nodemask, unsigned long maxnode,
 		       unsigned flags)
 {
-	if (syscall(__NR_mbind, (long)addr, length, mode, (long)nodemask,
-		    maxnode, flags)) {
+	long code = syscall(__NR_mbind, (long)addr, length, mode,
+			    (long)nodemask, maxnode, flags);
+	if (code)
 		perror("mbind");
-		return EXIT_FAILURE;
-	}
-	return EXIT_SUCCESS;
+	return code;
 }
 
 static int safe_mlock(const void *addr, size_t length)
 {
-	if (mlock(addr, length)) {
+	int code = mlock(addr, length);
+
+	if (code)
 		fprintf(stderr, "munmap %zu: %s\n", length, strerror(errno));
-		return EXIT_FAILURE;
-	}
-	return EXIT_SUCCESS;
+	return code;
 }
 
 static long safe_migrate_pages(int pid, unsigned long max_node,
 			       const unsigned long *old_nodes,
 			       const unsigned long *new_nodes)
 {
-	if (syscall(__NR_migrate_pages, pid, max_node, old_nodes,
-		    new_nodes) < 0) {
+	long code = syscall(__NR_migrate_pages, pid, max_node, old_nodes,
+			    new_nodes);
+	if (code < 0)
 		perror("migrate_pages");
-		return EXIT_FAILURE;
-	}
-	return EXIT_SUCCESS;
+	return code;
 }
 
-static int safe_fread(void *ptr, size_t size, size_t item, FILE *fp)
+static int safe_ferror(FILE *fp, const char *reason)
 {
-	fread(ptr, sizeof(ptr), item, fp);
-	if (ferror(fp)) {
-		perror("fread");
-		fclose(fp);
-		return EXIT_FAILURE;
-	}
-	return EXIT_SUCCESS;
-}
+	int code = ferror(fp);
 
-static int safe_fwrite(void *ptr, size_t size, size_t item, FILE *fp)
-{
-	if (!fwrite(ptr, size, item, fp)) {
-		perror("fwrite");
+	if (code) {
+		perror(reason);
 		fclose(fp);
-		return EXIT_FAILURE;
 	}
-	return EXIT_SUCCESS;
+	return code;
 }
 
 static int safe_lstat(const char *path, struct stat *stat)
 {
-	if (lstat(path, stat)) {
+	int code = lstat(path, stat);
+
+	if (code)
 		fprintf(stderr, "lstat %s: %s\n", path, strerror(errno));
-		return EXIT_FAILURE;
-	}
-	return EXIT_SUCCESS;
+	return code;
 }
 
 static int safe_open(const char *path, int flags)
@@ -182,7 +170,7 @@ static size_t get_meminfo(char *field)
 {
 	FILE *fp = safe_fopen("/proc/meminfo", "r");
 	char *line = NULL;
-	char key[100];
+	char key[1024];
 	size_t length = 0;
 	size_t value = -1;
 
@@ -217,7 +205,8 @@ static long set_node_huge(int node, long size, size_t huge_size)
 	if (!fp)
 		return -1;
 
-	if (safe_fread(value, sizeof(value), 1, fp))
+	fread(value, sizeof(value), 1, fp);
+	if (safe_ferror(fp, "read nr_hugepages"))
 		return -1;
 
 	save = atol(value);
@@ -225,7 +214,9 @@ static long set_node_huge(int node, long size, size_t huge_size)
 		goto out;
 
 	snprintf(value, sizeof(value), "%ld", size);
-	if (safe_fwrite(value, sizeof(value), 1, fp))
+	fwrite(value, sizeof(value), 1, fp);
+	fflush(fp);
+	if (safe_ferror(fp, "write nr_hugepages"))
 		return -1;
 out:
 	fclose(fp);
@@ -373,7 +364,8 @@ static int read_file(char *path, char *buf)
 	if (!fp)
 		return EXIT_FAILURE;
 
-	if (safe_fread(buf, sizeof(buf), 1, fp)) {
+	fread(buf, sizeof(buf), 1, fp);
+	if (safe_ferror(fp, path)) {
 		close(fd);
 		return EXIT_FAILURE;
 	}
@@ -401,10 +393,11 @@ static int write_value(char *path, long value)
 		return -1;
 
 	snprintf(s, sizeof(s), "%ld", value);
-	if (safe_fwrite(s, sizeof(s), 1, fp)) {
-		fclose(fp);
+	fwrite(s, sizeof(s), 1, fp);
+	fflush(fp);
+	if (safe_ferror(fp, __func__))
 		return EXIT_FAILURE;
-	}
+
 	fclose(fp);
 	return EXIT_SUCCESS;
 }
@@ -424,13 +417,17 @@ static int scan_ksm()
 	if (!fp)
 		return -1;
 
-	if (safe_fread(value, sizeof(value), 1, fp))
+	fread(value, sizeof(value), 1, fp);
+	if (safe_ferror(fp, "read ksm"))
 		return -1;
 
 	run = atoi(value);
-	if (run != 1 && safe_fwrite("1", 2, 1, fp))
-		return -1;
-
+	if (run != 1) {
+		fwrite("1", 2, 1, fp);
+		fflush(fp);
+		if (safe_ferror(fp, "write ksm"))
+			return -1;
+	}
 	fclose(fp);
 	snprintf(path, sizeof(path), "%s/full_scans", base);
 	scans = read_value(path);
@@ -458,7 +455,10 @@ static int scan_ksm()
 	return run;
 out:
 	snprintf(value, sizeof(value), "%d", run);
-	safe_fwrite(value, sizeof(value), 1, fp);
+	fwrite(value, sizeof(value), 1, fp);
+	fflush(fp);
+	if (!safe_ferror(fp, "restore ksm"))
+		fclose(fp);
 	return -1;
 }
 
@@ -560,25 +560,28 @@ static int hotplug_memory()
 				 memory->d_name);
 			fp = fopen(path, "w+");
 			if (!fp)
-				continue;
-
-			if (safe_fwrite("offline", 8, 1, fp)) {
-				fflush(fp);
-				if (safe_fwrite("online", 7, 1, fp)) {
-					fclose(fp);
-					closedir(section);
-					closedir(dir);
-					return EXIT_FAILURE;
-				}
-			}
+				goto out;
+			fwrite("offline", 8, 1, fp);
+			fflush(fp);
+			if (safe_ferror(fp, "offline"))
+				goto out;
+			fwrite("online", 7, 1, fp);
+			fflush(fp);
+			if (safe_ferror(fp, "online"))
+				goto fail;
 			fclose(fp);
 			break;
 		}
+out:
 		closedir(section);
 	}
 	closedir(dir);
 	printf("- pass: %s\n", __func__);
 	return EXIT_SUCCESS;
+fail:
+	closedir(section);
+	closedir(dir);
+	return EXIT_FAILURE;
 }
 
 /* Migrate hugepages while soft offlining. */
@@ -702,11 +705,12 @@ static int migrate_ksm()
 			mask1[0] = 1 << node1;
 			mask2[0] = 1 << node2;
 		}
-		if (safe_migrate_pages(0, NR_NODE, mask1, mask2))
+		if (safe_migrate_pages(0, NR_NODE, mask1, mask2) < 0)
 			goto out;
 	}
 	for (i = 0; i < NR_PAGE; i++)
-		safe_munmap(pages[i], pagesz);
+		if (safe_munmap(pages[i], pagesz))
+			return EXIT_FAILURE;
 
 	if (run == 1)
 		goto pass;
@@ -730,11 +734,12 @@ static int read_all(char *path, bool is_top)
 	struct stat dent_st;
 	char subpath[PATH_MAX];
 	char buf[1024];
+	static unsigned long count = 0;
 
-	if (is_top) {
-		snprintf(buf, sizeof(buf), "%s %s", __func__, path);
-		print_start(buf);
-	}
+	if (is_top)
+		print_start(__func__);
+	if (!(count++ % 10))
+		printf("- info: %s\n", path);
 	if (!dir)
 		return EXIT_FAILURE;
 
