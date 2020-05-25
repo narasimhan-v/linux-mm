@@ -6,11 +6,22 @@ set -eux -o pipefail
 
 arch=$(uname -m)
 cpus=$(lscpu | sed -n 's/^CPU(s): *\([0-9]*\)/\1/p')
-cc=gcc
+: ${CC:=gcc}
 
 args="page_poison=on page_owner=on numa_balancing=enable \
 systemd.unified_cgroup_hierarchy=1 debug_guardpage_minorder=1 \
 page_alloc.shuffle=1"
+
+build_clang()
+{
+	yum -y install gcc-c++ python3 cmake ninja-build
+	git clone https://github.com/ClangBuiltLinux/tc-build.git
+	cd tc-build
+	# Need GCC to compile it.
+	CC=gcc ./build-llvm.py -b 151ed6aa38a3ec6c01973b35f684586b6e1c0f7e \
+		--install-folder /usr/local
+	cd ..
+}
 
 if [[ "$arch" == 's390x' ]]; then
 	old=$(grep 'options ' /boot/loader/entries/*-$(uname -r).conf)
@@ -65,7 +76,17 @@ if [ ! -f .config ]; then
 		# https://lore.kernel.org/linux-mm/1566421927.5576.3.camel@lca.pw/
 		grub2-editenv - set \
 		    "$old $common earlyprintk=$serial memmap=4G!4G"
-		cp ../x86.config .config
+		if [[ "$CC" == 'clang' ]]; then
+			cp ../kcsan.config .config
+			# KCSAN needs at least Clang 11.
+			if ! which clang; then
+				cd ..
+				build_clang
+				cd linux
+			fi
+		else
+			cp ../x86.config .config
+		fi
 	elif [[ "$arch" == 's390x' ]]; then
 		sed -i 's/^timeout=.*/timeout=30/' /etc/zipl.conf
 		sed -i "s;$old;$old $common;" \
@@ -110,17 +131,13 @@ ls ../patch/* | while read i; do
 done
 set -e
 
-if [[ "$arch" == 'aarch64' ]]; then
-	cc=clang
-fi
-
 if [ -s "$diff" ]; then
 	patch -Np1 < "$diff"
 fi
 
-make W=1 CC=$cc -j $cpus 2> warn.txt
-make CC=$cc modules_install
-make CC=$cc install
+make W=1 CC=$CC -j $cpus 2> warn.txt
+make CC=$CC modules_install
+make CC=$CC install
 
 # Some kernels have CONFIG_BLK_DEV_DM_BUILTIN=y, so need to include dm-mod
 # manually for a LVM rootfs.
