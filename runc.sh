@@ -24,6 +24,15 @@ manifestJson="$(
 		-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
 		"$registryBase/v2/$image/manifests/latest"
 )"
+if [[ "$runc" == 'runc' ]] && ! which runc; then
+	go get github.com/opencontainers/runc
+	: ${GOPATH:=~/go}
+	save="$(pwd)"
+	cd "$GOPATH/src/github.com/opencontainers/runc/"
+	make BUILDTAGS=seccomp
+	make install
+	cd "$save"
+fi
 case "$arch" in
 'x86_64')
 	arch='amd64'
