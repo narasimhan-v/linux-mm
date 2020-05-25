@@ -94,11 +94,11 @@ set +e
 # Test a sysfs write code path.
 echo 1 > /sys/kernel/slab/fs_cache/shrink
 
-dmesg | grep -i warn | grep -v _NOWARN | grep -v warn_ | grep -v ?
-dmesg | grep -i bug | grep -v -i debug | grep -v ?
+dmesg | grep -i warn | grep -v -e _NOWARN -e warn_ -e  ?
+dmesg | grep -i bug | grep -vi -e debug -e ?
 dmesg | grep -i error | grep -v ?
-dmesg | grep -i leak | grep -v kmemleak_
+dmesg | grep -i leak | grep -v -e kmemleak_ -e ?
 dmesg | grep UBSAN
-dmesg | grep -i corruption
-dmesg | grep -i invalid | grep -v ?
+dmesg | grep -i corrupt
+dmesg | grep -iw invalid | grep -v ?
 dmesg | grep -i -e "could not" -e cannot
