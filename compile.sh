@@ -64,7 +64,6 @@ if [ ! -f .config ]; then
 
 	if [[ "$arch" == 'aarch64' ]]; then
 		grub2-editenv - set "$old $common"
-		yum -y install clang
 		cp ../arm64.config .config
 	elif [[ "$arch" == 'ppc64le' ]]; then
 		grub2-editenv - set "$old $new $common earlyprintk"
@@ -79,12 +78,6 @@ if [ ! -f .config ]; then
 		    "$old $common earlyprintk=$serial memmap=4G!4G"
 		if [[ "$CC" == 'clang' ]]; then
 			cp ../kcsan.config .config
-			# KCSAN needs at least Clang 11.
-			if ! which clang; then
-				cd ..
-				build_clang
-				cd linux
-			fi
 		else
 			cp ../x86.config .config
 		fi
@@ -136,6 +129,12 @@ if [ -s "$diff" ]; then
 	patch -Np1 < "$diff"
 fi
 
+# KCSAN needs at least Clang 11.
+if [[ "$CC" == 'clang' ]] && ! which clang; then
+	cd ..
+	build_clang
+	cd linux
+fi
 make W=1 CC=$CC -j $cpus 2> warn.txt
 make CC=$CC modules_install
 make CC=$CC install
