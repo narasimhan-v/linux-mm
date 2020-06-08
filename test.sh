@@ -4,29 +4,6 @@ set -eux -o pipefail
 
 arch=$(uname -m)
 
-if [ ! -f /sys/kernel/kexec_crash_size ] ||
-   [[ $(cat /sys/kernel/kexec_crash_size) == '0' ]]; then
-	echo '- error: kexec_crash_size' >&2
-	exit 1
-fi
-
-# The powerpc has CONFIG_HAVE_DMA_CONTIGUOUS=n.
-if [[ "$arch" != 'ppc64le' ]]; then
-	if [ ! -f /sys/kernel/debug/cma/cma-reserved/count ] ||
-	   [[ $(cat /sys/kernel/debug/cma/cma-reserved/count) == '0' ]]; then
-		echo '- error: cma-reserved/count' >&2
-		exit 1
-	fi
-fi
-
-if [[ "$arch" == 'x86_64' ]] && ! ls -l /dev/pmem0; then
-	echo '- error: /dev/pmem0 is gone.' >&2
-	exit 1
-fi
-
-echo function > /sys/kernel/debug/tracing/current_tracer
-echo nop > /sys/kernel/debug/tracing/current_tracer
-
 # Test memory online and offline.
 set +e
 i=0
@@ -42,20 +19,16 @@ for mem in $(ls -d /sys/devices/system/memory/memory*); do
 	echo online > $mem/state
 done
 set -e
-
 if [ ! -d ltp ]; then
 	git clone https://github.com/linux-test-project/ltp.git
 fi
-
 if [ ! -x /opt/ltp/runltp ]; then
 	cd ltp
 	make autotools
 	./configure
-
 	cpus=$(lscpu | sed -n 's/^CPU(s): *\([0-9]*\)/\1/p')
 	make -j "$cpus"
 	make install
-
 	# The kernel may lack of keyctl configs.
 	sed -i '/keyctl.*/d' /opt/ltp/runtest/syscalls
 
@@ -86,7 +59,6 @@ if [ ! -x /opt/ltp/runltp ]; then
 	esac
 	cd ..
 fi
-
 # Don't care about the individual test case correctness here.
 set +e
 /opt/ltp/runltp -f syscalls,mm,fs,hugetlb,cpuhotplug
