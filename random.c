@@ -795,7 +795,7 @@ static int read_all(char *path, bool is_top)
 	return EXIT_SUCCESS;
 }
 
-int alloc_mmap_hotplug_memory(void *data)
+static int alloc_mmap_hotplug_memory(void *data)
 {
 	int code = alloc_mmap(*(size_t *)data);
 
@@ -804,7 +804,7 @@ int alloc_mmap_hotplug_memory(void *data)
 	return code;
 }
 
-int migrate_huge_hotplug_memory(void *data)
+static int migrate_huge_hotplug_memory(void *data)
 {
 	int code = migrate_huge_offline(*(size_t *)data);
 
@@ -813,18 +813,37 @@ int migrate_huge_hotplug_memory(void *data)
 	return code;
 }
 
-int read_all_debugfs(void *data)
+static int read_all_debugfs(void *data)
 {
 	return read_all("/sys/kernel/debug", true);
+}
+
+static void list_bug(struct bug *bugs[])
+{
+	int i;
+
+	for (i = 0; bugs[i]; i++)
+		printf("%d: %s\n", bugs[i]->number, bugs[i]->string);
+}
+
+void static usage(const char *name)
+{
+	fprintf(stderr, "Usage: %s %s\n%s\n", name,
+		"[-l] [-x #bug] [#bug]",
+"-h: print out this text.\n"
+"-l: list all bugs numbers and their descriptions.\n"
+"-x: exclude a bug by number. Can specify multiple times.\n"
+"Trigger a bug by number. Can specify multiple times.");
 }
 
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
 	int i = 0;
-	int j;
+	int j, c, skip;
 	int code = 0;
-	struct bug *bugs[NR_BUG];
+	struct bug *bugs[NR_BUG] = { NULL };
+	int ignore[NR_BUG] = { 0 };
 
 	free_size = get_meminfo("MemFree:");
 	if (free_size < 0)
@@ -832,25 +851,51 @@ int main(int argc, char *argv[])
 	size = free_size * 1.2;
 	/* Allocate a bit more to trigger swapping/OOM. */
 	bugs[i] = new(i, alloc_mmap_hotplug_memory, &size,
-		      "Trigger swapping/OOM, and then offline all memory.");
+		"trigger swapping/OOM, and then offline all memory.");
 	i++;
 	bugs[i] = new(i, migrate_huge_hotplug_memory, &free_size,
-		      "Migrate hugepages while soft offlining, and then "
-		      "offline all memory.");
+		"migrate hugepages while soft offlining, and then offline "
+		"all memory.");
 	i++;
 	bugs[i] = new(i, migrate_ksm, NULL,
-		      "Migrate KSM pages repetitively.");
+		"migrate KSM pages repetitively.");
 	i++;
-	bugs[i] = new(i, read_all_debugfs, NULL, "Read all debugfs files.");
+	bugs[i] = new(i, read_all_debugfs, NULL, "read all debugfs files.");
 	i++;
 
-	if (argc != 1) {
-		j = atol(argv[1]) - 1;
-		return bugs[j]->func(bugs[j]->data);
+	while ((c = getopt(argc, argv, "hlx:")) != EOF)
+		switch(c) {
+		case 'x':
+			skip = strtol(optarg, NULL, 10);
+			if (skip < i)
+				ignore[skip] = 1;
+			break;
+		case 'l':
+			list_bug(bugs);
+			goto out;
+		case 'h': /* fall-through */
+		default:
+			usage(argv[0]);
+			goto out;
+		}
+	/* These are the arguments after the command-line options. */
+	if (optind < argc) {
+		for (; optind < argc; optind++) {
+			j = strtol(argv[optind], NULL, 10);
+			if (j >= i)
+				continue;
+			code += bugs[j]->func(bugs[j]->data);
+		}
+	} else {
+		for (j = 0; j < i; j++) {
+			if (ignore[j])
+				continue;
+			code += bugs[j]->func(bugs[j]->data);
+		}
 	}
-	for (j = 0; j < i; j++) {
-		code += bugs[j]->func(bugs[j]->data);
+out:
+	for (j = 0; j < i; j++)
 		delete(bugs[j]);
-	}
+
 	return code;
 }
