@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * random kernel bug collection
- *
- * Accept an additional argument to trigger a specific bug by number.
- * 1: trigger swapping/OOM, and then offline all memory.
- * 2: migrate hugepages while soft offlining, and then offline all memory.
- * 3: migrate KSM pages repetitively.
- * 4: read all debugfs files.
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -29,19 +23,18 @@
 #define MADV_SOFT_OFFLINE 101
 #define MPOL_BIND 2
 #define MPOL_MF_MOVE_ALL (1 << 2)
+#define NR_BUG 5000
 #define NR_LOOP 1000
 #define NR_NODE 4096
 #define NR_PAGE 20
 #define NR_THREAD 10
 
-#define TRIGGER(BUG) \
-	do { \
-		if (argc == 1 || select == ++bug) { \
-			BUG; \
-			if (argc != 1) \
-				return code; \
-		} \
-	} while (0)
+struct bug {
+	int number;
+	int (* func)(void *data);
+	void *data;
+	char *string;
+};
 
 static void print_start(const char *name)
 {
@@ -57,7 +50,7 @@ static void *safe_malloc(size_t length)
 	return addr;
 }
 
-static DIR *safe_opendir(char *path)
+static DIR *safe_opendir(const char *path)
 {
 	DIR *dir = opendir(path);
 
@@ -66,7 +59,7 @@ static DIR *safe_opendir(char *path)
 	return dir;
 }
 
-static FILE *safe_fopen(char *path, const char *mode)
+static FILE *safe_fopen(const char *path, const char *mode)
 {
 	FILE *fp = fopen(path, mode);
 
@@ -164,6 +157,25 @@ static FILE *safe_fdopen(int fd, const char *mode)
 		close(fd);
 	}
 	return fp;
+}
+
+static struct bug *new(int number, int (* func)(void *data), void *data,
+		       char *string)
+{
+	struct bug *bug = safe_malloc(sizeof(struct bug));
+
+	if (!bug)
+		exit(EXIT_FAILURE);
+	bug->number = number;
+	bug->func = func;
+	bug->data = data;
+	bug->string = string;
+	return bug;
+}
+
+static void delete(struct bug *bug)
+{
+	free(bug);
 }
 
 static size_t get_meminfo(char *field)
@@ -659,7 +671,7 @@ static int migrate_huge_offline(size_t free_size)
 }
 
 /* Migrate KSM pages repetitively. */
-static int migrate_ksm()
+static int migrate_ksm(void *data)
 {
 	int node1, node2, i, j, m;
 	int pagesz = getpagesize();
@@ -783,25 +795,62 @@ static int read_all(char *path, bool is_top)
 	return EXIT_SUCCESS;
 }
 
+int alloc_mmap_hotplug_memory(void *data)
+{
+	int code = alloc_mmap(*(size_t *)data);
+
+	if (!code)
+		code = hotplug_memory();
+	return code;
+}
+
+int migrate_huge_hotplug_memory(void *data)
+{
+	int code = migrate_huge_offline(*(size_t *)data);
+
+	if (!code)
+		code = hotplug_memory();
+	return code;
+}
+
+int read_all_debugfs(void *data)
+{
+	return read_all("/sys/kernel/debug", true);
+}
+
 int main(int argc, char *argv[])
 {
-	size_t free_size;
-	long bug = 0;
-	long select;
-	long code = 0;
+	size_t free_size, size;
+	int i = 0;
+	int j;
+	int code = 0;
+	struct bug *bugs[NR_BUG];
 
-	if (argc != 1)
-		select = atol(argv[1]);
 	free_size = get_meminfo("MemFree:");
 	if (free_size < 0)
 		return EXIT_FAILURE;
-
+	size = free_size * 1.2;
 	/* Allocate a bit more to trigger swapping/OOM. */
-	TRIGGER(code += alloc_mmap(free_size * 1.2);
-		code += hotplug_memory());
-	TRIGGER(code += migrate_huge_offline(free_size);
-		code += hotplug_memory());
-	TRIGGER(code += migrate_ksm());
-	TRIGGER(code += read_all("/sys/kernel/debug", true));
+	bugs[i] = new(i, alloc_mmap_hotplug_memory, &size,
+		      "Trigger swapping/OOM, and then offline all memory.");
+	i++;
+	bugs[i] = new(i, migrate_huge_hotplug_memory, &free_size,
+		      "Migrate hugepages while soft offlining, and then "
+		      "offline all memory.");
+	i++;
+	bugs[i] = new(i, migrate_ksm, NULL,
+		      "Migrate KSM pages repetitively.");
+	i++;
+	bugs[i] = new(i, read_all_debugfs, NULL, "Read all debugfs files.");
+	i++;
+
+	if (argc != 1) {
+		j = atol(argv[1]) - 1;
+		return bugs[j]->func(bugs[j]->data);
+	}
+	for (j = 0; j < i; j++) {
+		code += bugs[j]->func(bugs[j]->data);
+		delete(bugs[j]);
+	}
 	return code;
 }
