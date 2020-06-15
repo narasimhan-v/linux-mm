@@ -248,7 +248,7 @@ static int mmap_offline_node_huge(size_t length)
 		if (addr == MAP_FAILED) {
 			if (i == 0 || errno != ENOMEM) {
 				perror("mmap");
-				return EXIT_FAILURE;
+				return 1;
 			}
 			usleep(1000);
 			continue;
@@ -257,16 +257,16 @@ static int mmap_offline_node_huge(size_t length)
 
 		code = madvise(addr, length, MADV_SOFT_OFFLINE);
 		if(safe_munmap(addr, length))
-			return EXIT_FAILURE;
+			return 1;
 
 		/* madvise() could return >= 0 on success. */
 		if (code < 0 && errno != EBUSY) {
 			perror("madvise");
-			return EXIT_FAILURE;
+			return 1;
 		}
 	}
 	printf("- pass: %s\n", __func__);
-	return EXIT_SUCCESS;
+	return 0;
 }
 
 static int loop_move_pages(int node1, int node2, size_t length)
@@ -312,7 +312,7 @@ out:
 	free(pages);
 	free(nodes);
 	free(status);
-	return EXIT_FAILURE;
+	return 1;
 }
 
 static int mmap_bind_node_huge(int node, size_t length)
@@ -325,19 +325,19 @@ static int mmap_bind_node_huge(int node, size_t length)
 	addr = safe_mmap(NULL, length, PROT_READ | PROT_WRITE,
 			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
 	if (addr == MAP_FAILED)
-		return EXIT_FAILURE;
+		return 1;
 
 	mask[0] = 1 << node;
 	if (safe_mbind(addr, length, MPOL_BIND, mask, NR_NODE, 0))
-		return EXIT_FAILURE;
+		return 1;
 
 	if (safe_mlock(addr, length))
-		return EXIT_FAILURE;
+		return 1;
 
 	if (safe_munmap(addr, length))
-		return EXIT_FAILURE;
+		return 1;
 
-	return EXIT_SUCCESS;
+	return 0;
 }
 
 static int get_numa(int *node1, int *node2)
@@ -349,7 +349,7 @@ static int get_numa(int *node1, int *node2)
 	fp = safe_fopen("/sys/devices/system/node/has_memory", "r");
 	if (!fp) {
 		fprintf(stderr, "- fail: it requires NUMA nodes.\n");
-		return EXIT_FAILURE;
+		return 1;
 	}
 	*node1 = -1;
 	*node2 = -1;
@@ -360,10 +360,10 @@ static int get_numa(int *node1, int *node2)
 
 	if (*node1 == -1 || *node2 == -1) {
 		fprintf(stderr, "- fail: it requires 2 NUMA nodes.\n");
-		return EXIT_FAILURE;
+		return 1;
 	}
 	printf("- info: use NUMA nodes %d,%d.\n", *node1, *node2);
-	return EXIT_SUCCESS;
+	return 0;
 }
 
 static int read_file(char *path, char *buf)
@@ -372,20 +372,20 @@ static int read_file(char *path, char *buf)
 	FILE *fp;
 
 	if (fd < 0)
-		return EXIT_FAILURE;
+		return 1;
 
 	fp = safe_fdopen(fd, "r");
 	if (!fp)
-		return EXIT_FAILURE;
+		return 1;
 
 	fread(buf, sizeof(buf), 1, fp);
 	if (safe_ferror(fp, path)) {
 		close(fd);
-		return EXIT_FAILURE;
+		return 1;
 	}
 	fclose(fp);
 	close(fd);
-	return EXIT_SUCCESS;
+	return 0;
 }
 
 static long read_value(char *path)
@@ -410,10 +410,10 @@ static int write_value(char *path, long value)
 	fwrite(s, sizeof(s), 1, fp);
 	fflush(fp);
 	if (safe_ferror(fp, __func__))
-		return EXIT_FAILURE;
+		return 1;
 
 	fclose(fp);
-	return EXIT_SUCCESS;
+	return 0;
 }
 
 static int scan_ksm()
@@ -529,12 +529,12 @@ static int alloc_mmap(size_t length)
 		exit(EXIT_SUCCESS);
 	case -1:
 		perror("- fail: fork");
-		return EXIT_FAILURE;
+		return 1;
 	default:
 		break;
 	}
 	wait(NULL);
-	return EXIT_SUCCESS;
+	return 0;
 }
 
 /* Offline and online all memory. */
@@ -548,7 +548,7 @@ static int hotplug_memory()
 	print_start(__func__);
 	dir = safe_opendir(base);
 	if (!dir)
-		return EXIT_FAILURE;
+		return 1;
 
 	while ((memory = readdir(dir))) {
 		struct dirent *final;
@@ -563,7 +563,7 @@ static int hotplug_memory()
 		section = safe_opendir(path);
 		if (!section) {
 			closedir(dir);
-			return EXIT_FAILURE;
+			return 1;
 		}
 		while ((final = readdir(section))) {
 			FILE *fp;
@@ -591,11 +591,11 @@ out:
 	}
 	closedir(dir);
 	printf("- pass: %s\n", __func__);
-	return EXIT_SUCCESS;
+	return 0;
 fail:
 	closedir(section);
 	closedir(dir);
-	return EXIT_FAILURE;
+	return 1;
 }
 
 /* Migrate hugepages while soft offlining. */
@@ -603,44 +603,44 @@ static int migrate_huge_offline(size_t free_size)
 {
 	size_t huge_size, length;
 	int node1, node2, status;
-	int code = EXIT_SUCCESS;
+	int code = 0;
 	long save1, save2;
 	pid_t pid;
 
 	print_start(__func__);
 	if (get_numa(&node1, &node2))
-		return EXIT_FAILURE;
+		return 1;
 
 	huge_size = get_meminfo("Hugepagesize:");
 	if (huge_size < 0)
-		return EXIT_FAILURE;
+		return 1;
 
 	/* 4 pages are required to trigger the bug. */
 	if (8 * huge_size > free_size) {
 		fprintf(stderr,
 			"- fail: not enough memory for 8 hugepages.\n");
-		return EXIT_FAILURE;
+		return 1;
 	}
 	save1 = set_node_huge(node1, -1, huge_size);
 	if (save1 < 0)
-		return EXIT_FAILURE;
+		return 1;
 
 	save2 = set_node_huge(node2, -1, huge_size);
 	if (save2 < 0)
-		return EXIT_FAILURE;
+		return 1;
 
 	if (set_node_huge(node1, save1 + 4, huge_size) < 0)
-		return EXIT_FAILURE;
+		return 1;
 
 	if (set_node_huge(node2, save2 + 4, huge_size) < 0)
-		return EXIT_FAILURE;
+		return 1;
 
 	length = 4 * huge_size * 1024;
 	if (mmap_bind_node_huge(node1, length))
-		return EXIT_FAILURE;
+		return 1;
 
 	if (mmap_bind_node_huge(node2, length))
-		return EXIT_FAILURE;
+		return 1;
 
 	length = 2 * huge_size * 1024;
 	switch(pid = fork()) {
@@ -649,26 +649,26 @@ static int migrate_huge_offline(size_t free_size)
 	case -1:
 		perror("- fail: fork");
 
-		return EXIT_FAILURE;
+		return 1;
 	default:
 		break;
 	}
 	if (mmap_offline_node_huge(length))
-		code = EXIT_FAILURE;
+		code = 1;
 	if (kill(pid, SIGKILL)) {
 		perror("kill");
-		code = EXIT_FAILURE;
+		code = 1;
 	}
 	if (waitpid(pid, &status, 0) < 0) {
 		perror("waitpid");
-		code = EXIT_FAILURE;
+		code = 1;
 	}
 	if (WIFEXITED(status))
-		code = EXIT_FAILURE;
+		code = 1;
 	if (set_node_huge(node1, save1, huge_size) < 0)
-		code = EXIT_FAILURE;
+		code = 1;
 	if (set_node_huge(node2, save2, huge_size) < 0)
-		code = EXIT_FAILURE;
+		code = 1;
 	return code;
 }
 
@@ -684,7 +684,7 @@ static int migrate_ksm(void *data)
 
 	print_start(__func__);
 	if (get_numa(&node1, &node2))
-		return EXIT_FAILURE;
+		return 1;
 
 	for (i = 0; i < NR_PAGE; i++)
 	{
@@ -724,21 +724,21 @@ static int migrate_ksm(void *data)
 	}
 	for (i = 0; i < NR_PAGE; i++)
 		if (safe_munmap(pages[i], pagesz))
-			return EXIT_FAILURE;
+			return 1;
 
 	if (run == 1)
 		goto pass;
 
 	/* Restore. */
 	if (write_value("/sys/kernel/mm/ksm/run", run))
-		return EXIT_FAILURE;
+		return 1;
 pass:
 	printf("- pass: %s\n", __func__);
-	return EXIT_SUCCESS;
+	return 0;
 out:
 	for (j = 0; j < i; j++)
 		safe_munmap(pages[j], pagesz);
-	return EXIT_FAILURE;
+	return 1;
 }
 
 static int read_all(char *path, bool is_top)
@@ -755,7 +755,7 @@ static int read_all(char *path, bool is_top)
 	if (!(count++ % 10))
 		printf("- info: %s\n", path);
 	if (!dir)
-		return EXIT_FAILURE;
+		return 1;
 
 	while ((entry = readdir(dir))) {
 		if (!strcmp (entry->d_name, "."))
@@ -774,7 +774,7 @@ static int read_all(char *path, bool is_top)
 		case DT_UNKNOWN:
 			if (safe_lstat(subpath, &dent_st)) {
 				closedir(dir);
-				return EXIT_FAILURE;
+				return 1;
 			}
 			switch(dent_st.st_mode & S_IFMT) {
 			case S_IFDIR:
@@ -794,7 +794,7 @@ static int read_all(char *path, bool is_top)
 	if (is_top)
 		printf("- pass: %s\n", __func__);
 
-	return EXIT_SUCCESS;
+	return 0;
 }
 
 static int alloc_mmap_hotplug_memory(void *data)
@@ -839,6 +839,35 @@ static void usage(const char *name)
 "Trigger a bug by number. Can specify multiple times.");
 }
 
+static int cat(const char *from, FILE *fp_to)
+{
+	FILE *fp = safe_fopen(from, "r");
+	int c;
+
+	if (!fp)
+		return 1;
+
+	while ((c = getc(fp)) != EOF)
+		putc(c, fp_to);
+
+	fclose(fp);
+	return 0;
+}
+
+static int copy(const char *from, const char *to)
+{
+	FILE *fp = safe_fopen(to, "w");
+
+	if (!fp)
+		return 1;
+
+	if (cat(from, fp))
+		return 1;
+
+	fclose(fp);
+	return 0;
+}
+
 static int build_kernel()
 {
 	DIR *dir;
@@ -847,25 +876,25 @@ static int build_kernel()
 	char *diff = "/tmp/test.patch";
 
 	if (system("rpm -q ncurses-devel")) {
-		if (system("yum -y install openssl-devel bc bison flex patch "
-			   "ncurses-devel"))
-			return EXIT_FAILURE;
+		if (system("dnf -y install openssl-devel bc bison flex patch "
+			   "ncurses-devel elfutils-libelf-devel"))
+			return 1;
 	}
 	dir = opendir("./linux-next");
 	if (!dir) {
 		if (system("git clone https://git.kernel.org/pub/scm/linux/"
 			   "kernel/git/next/linux-next.git"))
-			return EXIT_FAILURE;
+			return 1;
 	}
 	closedir(dir);
 	if (chdir("./linux-next")) {
 		perror("chdir");
-		return EXIT_FAILURE;
+		return 1;
 	}
 	if(access(".config", F_OK)) {
 		if (uname(&uts)) {
 			perror("uname");
-			return EXIT_FAILURE;
+			return 1;
 		}
 		if (!strcmp(uts.machine, "x86_64")) {
 			prefix="x86";
@@ -878,46 +907,46 @@ static int build_kernel()
 		} else {
 			fprintf(stderr, "- error: unsupported arch %s.\n",
 				uts.machine);
-			return EXIT_FAILURE;
+			return 1;
 		}
-		snprintf(cmd, sizeof(cmd), "cp ../%s.config .config", prefix);
-		if (system(cmd))
-			return EXIT_FAILURE;
+		snprintf(cmd, sizeof(cmd), "../%s.config", prefix);
+		if (copy(cmd, "./.config"))
+			return 1;
 	} else {
 		if (system("git remote update"))
-			return EXIT_FAILURE;
+			return 1;
 	}
 	snprintf(cmd, sizeof(cmd), "git diff > %s", diff);
 	if (system(cmd))
-		return EXIT_FAILURE;
+		return 1;
 
 	if (system("git reset --hard origin/master"))
-		return EXIT_FAILURE;
+		return 1;
 
 	if (!access(diff, F_OK)) {
 		snprintf(cmd, sizeof(cmd), "patch -Np1 < %s", diff);
 		if (system(cmd))
-			return EXIT_FAILURE;
+			return 1;
 	}
 	if (!access("./warn.txt", F_OK)) {
-		if (system("cp warn.txt warn.txt.orig"))
-			return EXIT_FAILURE;
+		if (copy("./warn.txt", "./warn.txt.orig"))
+			return 1;
 	}
 	/* There is no guarantee a higher thread number will be faster. */
 	if (system("make -j 48 2> warn.txt"))
-		return EXIT_FAILURE;
+		return 1;
 
 	if (system("make modules_install"))
-		return EXIT_FAILURE;
+		return 1;
 
 	if (system("make install"))
-		return EXIT_FAILURE;
+		return 1;
 
 	if (!access("./warn.txt", F_OK)) {
-		if (system("cat warn.txt"))
-			return EXIT_FAILURE;
+		if (cat("./warn.txt", stdout))
+			return 1;
 	}
-	return EXIT_SUCCESS;
+	return 0;
 }
 
 int main(int argc, char *argv[])
@@ -931,7 +960,7 @@ int main(int argc, char *argv[])
 
 	free_size = get_meminfo("MemFree:");
 	if (free_size < 0)
-		return EXIT_FAILURE;
+		return 1;
 	size = free_size * 1.2;
 	/* Allocate a bit more to trigger swapping/OOM. */
 	bugs[i] = new(i, alloc_mmap_hotplug_memory, &size,
