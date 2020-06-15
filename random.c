@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 
 #define MADV_SOFT_OFFLINE 101
@@ -166,6 +167,7 @@ static struct bug *new(int number, int (* func)(void *data), void *data,
 
 	if (!bug)
 		exit(EXIT_FAILURE);
+
 	bug->number = number;
 	bug->func = func;
 	bug->data = data;
@@ -826,14 +828,96 @@ static void list_bug(struct bug *bugs[])
 		printf("%d: %s\n", bugs[i]->number, bugs[i]->string);
 }
 
-void static usage(const char *name)
+static void usage(const char *name)
 {
 	fprintf(stderr, "Usage: %s %s\n%s\n", name,
-		"[-l] [-x #bug] [#bug]",
+		"[-l] [-b] [-x #bug] [#bug]",
+"-b: build kernel from linux-next.\n"
 "-h: print out this text.\n"
 "-l: list all bugs numbers and their descriptions.\n"
 "-x: exclude a bug by number. Can specify multiple times.\n"
 "Trigger a bug by number. Can specify multiple times.");
+}
+
+static int build_kernel()
+{
+	DIR *dir;
+	struct utsname uts;
+	char cmd[1024], *prefix;
+	char *diff = "/tmp/test.patch";
+
+	if (system("rpm -q ncurses-devel")) {
+		if (system("yum -y install openssl-devel bc bison flex patch "
+			   "ncurses-devel"))
+			return EXIT_FAILURE;
+	}
+	dir = opendir("./linux-next");
+	if (!dir) {
+		if (system("git clone https://git.kernel.org/pub/scm/linux/"
+			   "kernel/git/next/linux-next.git"))
+			return EXIT_FAILURE;
+	}
+	closedir(dir);
+	if (chdir("./linux-next")) {
+		perror("chdir");
+		return EXIT_FAILURE;
+	}
+	if(access(".config", F_OK)) {
+		if (uname(&uts)) {
+			perror("uname");
+			return EXIT_FAILURE;
+		}
+		if (!strcmp(uts.machine, "x86_64")) {
+			prefix="x86";
+		} else if (!strcmp(uts.machine, "aarch64")) {
+			prefix="arm64";
+		} else if (!strcmp(uts.machine, "ppc64le")) {
+			prefix="powerpc";
+		} else if (!strcmp(uts.machine, "s390x")) {
+			prefix="s390";
+		} else {
+			fprintf(stderr, "- error: unsupported arch %s.\n",
+				uts.machine);
+			return EXIT_FAILURE;
+		}
+		snprintf(cmd, sizeof(cmd), "cp ../%s.config .config", prefix);
+		if (system(cmd))
+			return EXIT_FAILURE;
+	} else {
+		if (system("git remote update"))
+			return EXIT_FAILURE;
+	}
+	snprintf(cmd, sizeof(cmd), "git diff > %s", diff);
+	if (system(cmd))
+		return EXIT_FAILURE;
+
+	if (system("git reset --hard origin/master"))
+		return EXIT_FAILURE;
+
+	if (!access(diff, F_OK)) {
+		snprintf(cmd, sizeof(cmd), "patch -Np1 < %s", diff);
+		if (system(cmd))
+			return EXIT_FAILURE;
+	}
+	if (!access("./warn.txt", F_OK)) {
+		if (system("cp warn.txt warn.txt.orig"))
+			return EXIT_FAILURE;
+	}
+	/* There is no guarantee a higher thread number will be faster. */
+	if (system("make -j 48 2> warn.txt"))
+		return EXIT_FAILURE;
+
+	if (system("make modules_install"))
+		return EXIT_FAILURE;
+
+	if (system("make install"))
+		return EXIT_FAILURE;
+
+	if (!access("./warn.txt", F_OK)) {
+		if (system("cat warn.txt"))
+			return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
 }
 
 int main(int argc, char *argv[])
@@ -863,8 +947,11 @@ int main(int argc, char *argv[])
 	bugs[i] = new(i, read_all_debugfs, NULL, "read all debugfs files.");
 	i++;
 
-	while ((c = getopt(argc, argv, "hlx:")) != EOF)
+	while ((c = getopt(argc, argv, "bhlx:")) != -1)
 		switch(c) {
+		case 'b':
+			code = build_kernel();
+			goto out;
 		case 'x':
 			skip = strtol(optarg, NULL, 10);
 			if (skip < i)
