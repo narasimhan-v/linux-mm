@@ -2,6 +2,7 @@
 /*
  * random kernel bug collection
  */
+#include <assert.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -835,8 +836,9 @@ static void usage(const char *name)
 "-b: build kernel from linux-next.\n"
 "-h: print out this text.\n"
 "-l: list all bugs numbers and their descriptions.\n"
-"-x: exclude a bug by number. Can specify multiple times.\n"
-"Trigger a bug by number. Can specify multiple times.");
+"-x: exclude bugs by numbers.\n"
+"Trigger bugs by numbers.\n"
+"#bug can be specified multiple times and used as a range, e.g., 0-3");
 }
 
 static int cat(const char *from, FILE *fp_to)
@@ -949,14 +951,71 @@ static int build_kernel()
 	return 0;
 }
 
+int range(char *string, bool *array, int size, bool value)
+{
+	int i, j, len, start, end;
+	char buf[100];
+
+	assert(string);
+	assert(array);
+	len = strlen(string);
+
+	for (i = 0; i < len; i++) {
+		if (!isdigit(string[i]))
+			break;
+	}
+	if (!i)
+		goto out;
+
+	if (i == len) {
+		i = atoi(string);
+		if (i >= size)
+			goto out;
+
+		array[i] = value;
+		return 0;
+	}
+	if (string[i] != '-')
+		goto out;
+
+	for (j = i + 1; j < len; j++) {
+		if (!isdigit(string[j]))
+			break;
+	}
+	if (!j)
+		goto out;
+
+	if (j != len)
+		goto out;
+
+	snprintf(buf, i + 1, string);
+	start = atoi(buf);
+	end = atoi(string + i + 1);
+	if (start >= end)
+		goto out;
+
+	if (start >= size)
+		goto out;
+
+	for (; start <= end; start++)
+		array[start] = value;
+
+	return 0;
+out:
+	fprintf(stderr, "- error: invalid #bug or format\n");
+	return 1;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
 	int i = 0;
-	int j, c, skip;
+	int j, c;
 	int code = 0;
+	int xcount = 0;
 	struct bug *bugs[NR_BUG] = { NULL };
-	int ignore[NR_BUG] = { 0 };
+	char *skip[100] = { NULL };
+	bool ignore[NR_BUG];
 
 	free_size = get_meminfo("MemFree:");
 	if (free_size < 0)
@@ -976,15 +1035,13 @@ int main(int argc, char *argv[])
 	bugs[i] = new(i, read_all_debugfs, NULL, "read all debugfs files.");
 	i++;
 
-	while ((c = getopt(argc, argv, "bhlx:")) != -1)
+	while ((c = getopt(argc, argv, "bhlx:")) != -1) {
 		switch(c) {
 		case 'b':
 			code = build_kernel();
 			goto out;
 		case 'x':
-			skip = strtol(optarg, NULL, 10);
-			if (skip < i)
-				ignore[skip] = 1;
+			skip[xcount++] = optarg;
 			break;
 		case 'l':
 			list_bug(bugs);
@@ -994,20 +1051,34 @@ int main(int argc, char *argv[])
 			usage(argv[0]);
 			goto out;
 		}
+	}
 	/* These are the arguments after the command-line options. */
 	if (optind < argc) {
+		if (xcount) {
+			fprintf(stderr,
+				"- error: has both [-x #bug] and [#bug].\n");
+			code += 1;
+			goto out;
+		}
+		memset(ignore, true, sizeof(ignore));
 		for (; optind < argc; optind++) {
-			j = strtol(argv[optind], NULL, 10);
-			if (j >= i)
-				continue;
-			code += bugs[j]->func(bugs[j]->data);
+			code = range(argv[optind], ignore, sizeof(ignore),
+				     false);
+			if (code)
+				goto out;
 		}
 	} else {
-		for (j = 0; j < i; j++) {
-			if (ignore[j])
-				continue;
-			code += bugs[j]->func(bugs[j]->data);
+		memset(ignore, false, sizeof(ignore));
+		for (j = 0; j < xcount; j++) {
+			code = range(skip[j], ignore, sizeof(ignore), true);
+			if (code)
+				goto out;
 		}
+	}
+	for (j = 0; j < i; j++) {
+		if (ignore[j])
+			continue;
+		code += bugs[j]->func(bugs[j]->data);
 	}
 out:
 	for (j = 0; j < i; j++)
