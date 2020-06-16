@@ -543,8 +543,10 @@ static int hotplug_memory()
 {
 	char *base = "/sys/devices/system/memory";
 	char path[PATH_MAX];
-	DIR *dir, *section;
+	DIR *dir;
 	struct dirent *memory;
+	FILE *fp;
+	int value;
 
 	print_start(__func__);
 	dir = safe_opendir(base);
@@ -552,49 +554,38 @@ static int hotplug_memory()
 		return 1;
 
 	while ((memory = readdir(dir))) {
-		struct dirent *final;
-
-		if (!strcmp (memory->d_name, "."))
+		if (!strcmp(memory->d_name, "."))
 			continue;
-		if (!strcmp (memory->d_name, ".."))
+		if (!strcmp(memory->d_name, ".."))
 			continue;
 		if (memory->d_type != DT_DIR)
 			continue;
-		snprintf(path, sizeof(path), "%s/%s", base, memory->d_name);
-		section = safe_opendir(path);
-		if (!section) {
-			closedir(dir);
-			return 1;
-		}
-		while ((final = readdir(section))) {
-			FILE *fp;
-
-			if (!strcmp (final->d_name, "state"))
-				continue;
-			snprintf(path, sizeof(path), "%s/%s/state", base,
-				 memory->d_name);
-			fp = fopen(path, "w+");
-			if (!fp)
-				goto out;
-			fwrite("offline", 8, 1, fp);
-			fflush(fp);
-			if (safe_ferror(fp, "offline"))
-				goto out;
-			fwrite("online", 7, 1, fp);
-			fflush(fp);
-			if (safe_ferror(fp, "online"))
-				goto fail;
-			fclose(fp);
-			break;
-		}
-out:
-		closedir(section);
+		if (strncmp(memory->d_name, "memory", 6))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s/online", base,
+			 memory->d_name);
+		value = read_value(path);
+		if (value < 0)
+			goto out;
+		if (!value)
+			continue;
+		fp = fopen(path, "w");
+		if (!fp)
+			goto out;
+		fwrite("0", 2, 1, fp);
+		fflush(fp);
+		if (safe_ferror(fp, "offline"))
+			continue;
+		fwrite("1", 2, 1, fp);
+		fflush(fp);
+		if (safe_ferror(fp, "online"))
+			goto out;
+		fclose(fp);
 	}
 	closedir(dir);
 	printf("- pass: %s\n", __func__);
 	return 0;
-fail:
-	closedir(section);
+out:
 	closedir(dir);
 	return 1;
 }
@@ -759,9 +750,9 @@ static int read_all(char *path, bool is_top)
 		return 1;
 
 	while ((entry = readdir(dir))) {
-		if (!strcmp (entry->d_name, "."))
+		if (!strcmp(entry->d_name, "."))
 			continue;
-		if (!strcmp (entry->d_name, ".."))
+		if (!strcmp(entry->d_name, ".."))
 			continue;
 		snprintf(subpath, sizeof(subpath), "%s/%s", path,
 			 entry->d_name);
@@ -870,13 +861,76 @@ static int copy(const char *from, const char *to)
 	return 0;
 }
 
+/* Offline and online all CPUs. */
+static int hotplug_cpu(void *data)
+{
+	char *base = "/sys/devices/system/cpu";
+	char path[PATH_MAX];
+	DIR *dir;
+	struct dirent *cpu;
+	int total = 1, value;
+	FILE *fp;
+
+	if (data)
+		print_start(__func__);
+	dir = safe_opendir(base);
+	if (!dir)
+		return -1;
+
+	while ((cpu = readdir(dir))) {
+		if (!strcmp(cpu->d_name, "."))
+			continue;
+		if (!strcmp(cpu->d_name, ".."))
+			continue;
+		if (cpu->d_type != DT_DIR)
+			continue;
+		if (strncmp(cpu->d_name, "cpu", 3))
+			continue;
+		if (!isdigit(cpu->d_name[3]))
+			continue;
+		/* CPU0 offline is not always possible. */
+		if (!strcmp(cpu->d_name, "cpu0"))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s/online", base,
+			 cpu->d_name);
+		value = read_value(path);
+		if (value < 0)
+			goto out;
+		if (!value)
+			continue;
+		total++;
+		if (!data)
+			continue;
+		fp = fopen(path, "w");
+		fwrite("0", 2, 1, fp);
+		fflush(fp);
+		if (safe_ferror(fp, "offline"))
+			goto out;
+		fwrite("1", 2, 1, fp);
+		fflush(fp);
+		if (safe_ferror(fp, "online"))
+			goto out;
+		fclose(fp);
+	}
+	closedir(dir);
+	if (data)
+		printf("- pass: %s\n", __func__);
+	return total;
+out:
+	closedir(dir);
+	return -1;
+}
+
 static int build_kernel()
 {
 	DIR *dir;
 	struct utsname uts;
 	char cmd[1024], *prefix;
 	char *diff = "/tmp/test.patch";
+	int cpu = hotplug_cpu(NULL);
 
+	if (cpu < 1)
+		return 1;
 	if (system("rpm -q ncurses-devel")) {
 		if (system("dnf -y install openssl-devel bc bison flex patch "
 			   "ncurses-devel elfutils-libelf-devel"))
@@ -935,7 +989,10 @@ static int build_kernel()
 			return 1;
 	}
 	/* There is no guarantee a higher thread number will be faster. */
-	if (system("make -j 48 2> warn.txt"))
+	if (cpu > 64)
+		cpu = 64;
+	snprintf(cmd, sizeof(cmd), "make -j %d 2> warn.txt", cpu);
+	if (system(cmd))
 		return 1;
 
 	if (system("make modules_install"))
@@ -951,7 +1008,7 @@ static int build_kernel()
 	return 0;
 }
 
-int range(char *string, bool *array, int size, bool value)
+static int range(char *string, bool *array, int size, bool value)
 {
 	int i, j, len, start, end;
 	char buf[100];
@@ -1033,6 +1090,8 @@ int main(int argc, char *argv[])
 		"migrate KSM pages repetitively.");
 	i++;
 	bugs[i] = new(i, read_all_debugfs, NULL, "read all debugfs files.");
+	i++;
+	bugs[i] = new(i, hotplug_cpu, "", "offline and online all CPUs.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhlx:")) != -1) {
