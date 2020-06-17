@@ -75,10 +75,9 @@ static int alloc_mmap(size_t length);
 static int hotplug_memory();
 static int migrate_huge_offline(size_t free_size);
 static int migrate_ksm(void *data);
-static int read_all(char *path, bool is_top);
+static int read_all(const char *path);
 static int alloc_mmap_hotplug_memory(void *data);
 static int migrate_huge_hotplug_memory(void *data);
-static int read_all_debugfs(void *data);
 static void list_bug(struct bug *bugs[]);
 static void usage(const char *name);
 static int cat(const char *from, FILE *fp_to);
@@ -87,6 +86,7 @@ static int hotplug_cpu(void *data);
 static int build_kernel();
 static int range(char *string, bool *array, int size, bool value);
 static int oom(void *data);
+static int read_tree(void *data);
 
 static void print_start(const char *name)
 {
@@ -818,7 +818,7 @@ out:
 	return 1;
 }
 
-static int read_all(char *path, bool is_top)
+static int read_all(const char *path)
 {
 	DIR *dir = safe_opendir(path);
 	struct dirent *entry;
@@ -827,8 +827,6 @@ static int read_all(char *path, bool is_top)
 	char buf[1024];
 	static unsigned long count = 0;
 
-	if (is_top)
-		print_start(__func__);
 	if (!(count++ % 10))
 		printf("- info: %s\n", path);
 	if (!dir)
@@ -844,7 +842,7 @@ static int read_all(char *path, bool is_top)
 
 		switch(entry->d_type) {
 		case DT_DIR:
-			read_all(subpath, false);
+			read_all(subpath);
 			break;
 		case DT_LNK:
 			continue;
@@ -855,7 +853,7 @@ static int read_all(char *path, bool is_top)
 			}
 			switch(dent_st.st_mode & S_IFMT) {
 			case S_IFDIR:
-				read_all(subpath, false);
+				read_all(subpath);
 				break;
 			case S_IFLNK:
 				continue;
@@ -868,9 +866,6 @@ static int read_all(char *path, bool is_top)
 		}
 	}
 	closedir(dir);
-	if (is_top)
-		printf("- pass: %s\n", __func__);
-
 	return 0;
 }
 
@@ -894,9 +889,19 @@ static int migrate_huge_hotplug_memory(void *data)
 	return code;
 }
 
-static int read_all_debugfs(void *data)
+static int read_tree(void *data)
 {
-	return read_all("/sys/kernel/debug", true);
+	const char *path = (const char *)data;
+	int code;
+	char string[100];
+
+	snprintf(string, sizeof(string), "%s %s", __func__, path);
+	print_start(string);
+	code = read_all(path);
+	if (!code)
+		printf("- pass: %s\n", string);
+
+	return code;
 }
 
 static void list_bug(struct bug *bugs[])
@@ -1214,13 +1219,15 @@ int main(int argc, char *argv[])
 	bugs[i] = new(i, migrate_ksm, NULL,
 		"migrate KSM pages repetitively.");
 	i++;
-	bugs[i] = new(i, read_all_debugfs, NULL, "read all debugfs files.");
+	bugs[i] = new(i, read_tree, "/sys", "read all sysfs files.");
 	i++;
 	bugs[i] = new(i, hotplug_cpu, "", "offline and online all CPUs.");
 	i++;
 	bugs[i] = new(i, oom, NULL, "trigger normal OOM.");
 	i++;
 	bugs[i] = new(i, oom, "", "trigger NUMA OOM.");
+	i++;
+	bugs[i] = new(i, read_tree, "/proc", "read all procfs files.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhlx:")) != -1) {
