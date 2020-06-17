@@ -38,6 +38,57 @@ struct bug {
 	char *string;
 };
 
+static void print_start(const char *name);
+static void *safe_malloc(size_t length);
+static void print_start(const char *name);
+static void *safe_malloc(size_t length);
+static DIR *safe_opendir(const char *path);
+static FILE *safe_fopen(const char *path, const char *mode);
+static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
+		       off_t offset);
+static int safe_munmap(void *addr, size_t length);
+static long safe_mbind(void *addr, unsigned long length, int mode,
+		       const unsigned long *nodemask, unsigned long maxnode,
+		       unsigned flags);
+static int safe_mlock(const void *addr, size_t length);
+static long safe_migrate_pages(int pid, unsigned long max_node,
+			       const unsigned long *old_nodes,
+			       const unsigned long *new_nodes);
+static int safe_ferror(FILE *fp, const char *reason);
+static int safe_lstat(const char *path, struct stat *stat);
+static int safe_open(const char *path, int flags);
+static FILE *safe_fdopen(int fd, const char *mode);
+static struct bug *new(int number, int (* func)(void *data), void *data,
+		       char *string);
+static void delete(struct bug *bug);
+static size_t get_meminfo(char *field);
+static long set_node_huge(int node, long size, size_t huge_size);
+static int mmap_offline_node_huge(size_t length);
+static int loop_move_pages(int node1, int node2, size_t length);
+static int mmap_bind_node_huge(int node, size_t length);
+static int get_numa(int *node1, int *node2);
+static int read_file(char *path, char *buf);
+static long read_value(char *path);
+static int write_value(char *path, long value);
+static int scan_ksm();
+static void *thread_mmap(void *data);
+static void loop_mmap(size_t length);
+static int alloc_mmap(size_t length);
+static int hotplug_memory();
+static int migrate_huge_offline(size_t free_size);
+static int migrate_ksm(void *data);
+static int read_all(char *path, bool is_top);
+static int alloc_mmap_hotplug_memory(void *data);
+static int migrate_huge_hotplug_memory(void *data);
+static int read_all_debugfs(void *data);
+static void list_bug(struct bug *bugs[]);
+static void usage(const char *name);
+static int cat(const char *from, FILE *fp_to);
+static int copy(const char *from, const char *to);
+static int hotplug_cpu(void *data);
+static int build_kernel();
+static int range(char *string, bool *array, int size, bool value);
+
 static void print_start(const char *name)
 {
 	printf("- start: %s\n", name);
@@ -791,7 +842,7 @@ static int read_all(char *path, bool is_top)
 
 static int alloc_mmap_hotplug_memory(void *data)
 {
-	int code = alloc_mmap(*(size_t *)data);
+	int code = alloc_mmap((size_t)data);
 
 	if (!code)
 		code = hotplug_memory();
@@ -800,7 +851,7 @@ static int alloc_mmap_hotplug_memory(void *data)
 
 static int migrate_huge_hotplug_memory(void *data)
 {
-	int code = migrate_huge_offline(*(size_t *)data);
+	int code = migrate_huge_offline((size_t)data);
 
 	if (!code)
 		code = hotplug_memory();
@@ -875,7 +926,7 @@ static int hotplug_cpu(void *data)
 		print_start(__func__);
 	dir = safe_opendir(base);
 	if (!dir)
-		return -1;
+		return 1;
 
 	while ((cpu = readdir(dir))) {
 		if (!strcmp(cpu->d_name, "."))
@@ -913,12 +964,14 @@ static int hotplug_cpu(void *data)
 		fclose(fp);
 	}
 	closedir(dir);
-	if (data)
-		printf("- pass: %s\n", __func__);
-	return total;
+	if (!data)
+		return total;
+
+	printf("- pass: %s\n", __func__);
+	return 0;
 out:
 	closedir(dir);
-	return -1;
+	return 1;
 }
 
 static int build_kernel()
@@ -1079,10 +1132,10 @@ int main(int argc, char *argv[])
 		return 1;
 	size = free_size * 1.2;
 	/* Allocate a bit more to trigger swapping/OOM. */
-	bugs[i] = new(i, alloc_mmap_hotplug_memory, &size,
+	bugs[i] = new(i, alloc_mmap_hotplug_memory, (void *)size,
 		"trigger swapping/OOM, and then offline all memory.");
 	i++;
-	bugs[i] = new(i, migrate_huge_hotplug_memory, &free_size,
+	bugs[i] = new(i, migrate_huge_hotplug_memory, (void *)free_size,
 		"migrate hugepages while soft offlining, and then offline "
 		"all memory.");
 	i++;
