@@ -40,8 +40,6 @@ struct bug {
 
 static void print_start(const char *name);
 static void *safe_malloc(size_t length);
-static void print_start(const char *name);
-static void *safe_malloc(size_t length);
 static DIR *safe_opendir(const char *path);
 static FILE *safe_fopen(const char *path, const char *mode);
 static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
@@ -88,6 +86,7 @@ static int copy(const char *from, const char *to);
 static int hotplug_cpu(void *data);
 static int build_kernel();
 static int range(char *string, bool *array, int size, bool value);
+static int oom(void *data);
 
 static void print_start(const char *name)
 {
@@ -100,6 +99,7 @@ static void *safe_malloc(size_t length)
 
 	if (!addr)
 		fprintf(stderr, "malloc %zu: %s\n", length, strerror(errno));
+
 	return addr;
 }
 
@@ -109,6 +109,7 @@ static DIR *safe_opendir(const char *path)
 
 	if (!dir)
 		fprintf(stderr, "opendir %s: %s\n", path, strerror(errno));
+
 	return dir;
 }
 
@@ -118,6 +119,7 @@ static FILE *safe_fopen(const char *path, const char *mode)
 
 	if (!fp)
 		fprintf(stderr, "fopen %s: %s\n", path, strerror(errno));
+
 	return fp;
 }
 
@@ -129,6 +131,7 @@ static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
 	ptr = mmap(addr, length, prot, flags, fd, offset);
 	if (ptr == MAP_FAILED)
 		fprintf(stderr, "mmap %zu: %s\n", length, strerror(errno));
+
 	return ptr;
 }
 
@@ -138,6 +141,7 @@ static int safe_munmap(void *addr, size_t length)
 
 	if (code)
 		fprintf(stderr, "munmap %zu: %s\n", length, strerror(errno));
+
 	return code;
 }
 
@@ -147,8 +151,10 @@ static long safe_mbind(void *addr, unsigned long length, int mode,
 {
 	long code = syscall(__NR_mbind, (long)addr, length, mode,
 			    (long)nodemask, maxnode, flags);
+
 	if (code)
 		perror("mbind");
+
 	return code;
 }
 
@@ -158,6 +164,7 @@ static int safe_mlock(const void *addr, size_t length)
 
 	if (code)
 		fprintf(stderr, "munmap %zu: %s\n", length, strerror(errno));
+
 	return code;
 }
 
@@ -167,8 +174,10 @@ static long safe_migrate_pages(int pid, unsigned long max_node,
 {
 	long code = syscall(__NR_migrate_pages, pid, max_node, old_nodes,
 			    new_nodes);
+
 	if (code < 0)
 		perror("migrate_pages");
+
 	return code;
 }
 
@@ -189,6 +198,7 @@ static int safe_lstat(const char *path, struct stat *stat)
 
 	if (code)
 		fprintf(stderr, "lstat %s: %s\n", path, strerror(errno));
+
 	return code;
 }
 
@@ -198,6 +208,7 @@ static int safe_open(const char *path, int flags)
 
 	if (fd < 0)
 		fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+
 	return fd;
 }
 
@@ -224,6 +235,7 @@ static struct bug *new(int number, int (* func)(void *data), void *data,
 	bug->func = func;
 	bug->data = data;
 	bug->string = string;
+
 	return bug;
 }
 
@@ -356,6 +368,7 @@ static int loop_move_pages(int node1, int node2, size_t length)
 			   nodes, status, MPOL_MF_MOVE_ALL) < 0) {
 			if (errno == ENOMEM)
 				continue;
+
 			perror("move_pages");
 			goto out;
 		}
@@ -364,6 +377,7 @@ out:
 	free(pages);
 	free(nodes);
 	free(status);
+
 	return 1;
 }
 
@@ -525,6 +539,7 @@ out:
 	fflush(fp);
 	if (!safe_ferror(fp, "restore ksm"))
 		fclose(fp);
+
 	return -1;
 }
 
@@ -556,12 +571,23 @@ static void loop_mmap(size_t length)
 	if (!thread)
 		return;
 
+	if (!length)
+		size = 2UL * 1024 * 1024 * 1024 / NR_THREAD;
+
 	for (i = 0; i < NR_THREAD; i++) {
-		printf("- info: mmap %d%% memory: %zu\n", 100 / NR_THREAD,
-		       size);
+		if (length)
+			printf("- info: mmap %d%% memory: %zu\n",
+			       100 / NR_THREAD, size);
+		else
+			printf("- info: mmap memory: %zu\n", size);
+
 		if (pthread_create(&thread[i], NULL, thread_mmap,
 				   (void *)size))
 			perror("pthread_create");
+
+		/* Reset until OOM. */
+		if (!length)
+			i = 0;
 	}
 	for (i = 0; i < NR_THREAD; i++)
 		pthread_join(thread[i], NULL);
@@ -574,7 +600,9 @@ static int alloc_mmap(size_t length)
 {
 	pid_t pid;
 
-	print_start(__func__);
+	if (length)
+		print_start(__func__);
+
 	switch(pid = fork()) {
 	case 0:
 		loop_mmap(length * 1024);
@@ -613,24 +641,30 @@ static int hotplug_memory()
 			continue;
 		if (strncmp(memory->d_name, "memory", 6))
 			continue;
+
 		snprintf(path, sizeof(path), "%s/%s/online", base,
 			 memory->d_name);
 		value = read_value(path);
 		if (value < 0)
 			goto out;
+
 		if (!value)
 			continue;
+
 		fp = fopen(path, "w");
 		if (!fp)
 			goto out;
+
 		fwrite("0", 2, 1, fp);
 		fflush(fp);
 		if (safe_ferror(fp, "offline"))
 			continue;
+
 		fwrite("1", 2, 1, fp);
 		fflush(fp);
 		if (safe_ferror(fp, "online"))
 			goto out;
+
 		fclose(fp);
 	}
 	closedir(dir);
@@ -691,7 +725,6 @@ static int migrate_huge_offline(size_t free_size)
 		exit(loop_move_pages(node1, node2, length));
 	case -1:
 		perror("- fail: fork");
-
 		return 1;
 	default:
 		break;
@@ -712,6 +745,7 @@ static int migrate_huge_offline(size_t free_size)
 		code = 1;
 	if (set_node_huge(node2, save2, huge_size) < 0)
 		code = 1;
+
 	return code;
 }
 
@@ -729,8 +763,7 @@ static int migrate_ksm(void *data)
 	if (get_numa(&node1, &node2))
 		return 1;
 
-	for (i = 0; i < NR_PAGE; i++)
-	{
+	for (i = 0; i < NR_PAGE; i++) {
 		pages[i] = safe_mmap(NULL, pagesz, PROT_READ | PROT_WRITE |
 				     PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
 				     -1, 0);
@@ -781,6 +814,7 @@ pass:
 out:
 	for (j = 0; j < i; j++)
 		safe_munmap(pages[j], pagesz);
+
 	return 1;
 }
 
@@ -846,6 +880,7 @@ static int alloc_mmap_hotplug_memory(void *data)
 
 	if (!code)
 		code = hotplug_memory();
+
 	return code;
 }
 
@@ -855,6 +890,7 @@ static int migrate_huge_hotplug_memory(void *data)
 
 	if (!code)
 		code = hotplug_memory();
+
 	return code;
 }
 
@@ -924,6 +960,7 @@ static int hotplug_cpu(void *data)
 
 	if (data)
 		print_start(__func__);
+
 	dir = safe_opendir(base);
 	if (!dir)
 		return 1;
@@ -942,25 +979,31 @@ static int hotplug_cpu(void *data)
 		/* CPU0 offline is not always possible. */
 		if (!strcmp(cpu->d_name, "cpu0"))
 			continue;
+
 		snprintf(path, sizeof(path), "%s/%s/online", base,
 			 cpu->d_name);
 		value = read_value(path);
 		if (value < 0)
 			goto out;
+
 		if (!value)
 			continue;
+
 		total++;
 		if (!data)
 			continue;
+
 		fp = fopen(path, "w");
 		fwrite("0", 2, 1, fp);
 		fflush(fp);
 		if (safe_ferror(fp, "offline"))
 			goto out;
+
 		fwrite("1", 2, 1, fp);
 		fflush(fp);
 		if (safe_ferror(fp, "online"))
 			goto out;
+
 		fclose(fp);
 	}
 	closedir(dir);
@@ -984,17 +1027,17 @@ static int build_kernel()
 
 	if (cpu < 1)
 		return 1;
-	if (system("rpm -q ncurses-devel")) {
-		if (system("dnf -y install openssl-devel bc bison flex patch "
-			   "ncurses-devel elfutils-libelf-devel"))
+
+	if (system("rpm -q ncurses-devel") &&
+	    system("dnf -y install openssl-devel bc bison flex patch "
+		   "ncurses-devel elfutils-libelf-devel"))
 			return 1;
-	}
+
 	dir = opendir("./linux-next");
-	if (!dir) {
-		if (system("git clone https://git.kernel.org/pub/scm/linux/"
+	if (!dir && system("git clone https://git.kernel.org/pub/scm/linux/"
 			   "kernel/git/next/linux-next.git"))
 			return 1;
-	}
+
 	closedir(dir);
 	if (chdir("./linux-next")) {
 		perror("chdir");
@@ -1116,6 +1159,34 @@ out:
 	return 1;
 }
 
+static int oom(void *data)
+{
+	int node1, node2;
+	unsigned long mask[NR_NODE] = { 0 };
+	char string[100];
+
+	if (data)
+		snprintf(string, sizeof(string), "%s NUMA", __func__);
+	else
+		snprintf(string, sizeof(string), __func__);
+
+	print_start(string);
+	if (data) {
+		if (get_numa(&node1, &node2))
+			return 1;
+
+		mask[0] = 1 << node2;
+		if (syscall(__NR_set_mempolicy, MPOL_BIND, mask, NR_NODE)) {
+			perror("set_mempolicy");
+			return 1;
+		}
+	}
+	alloc_mmap(0);
+	printf("- pass: %s\n", __func__);
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -1130,6 +1201,7 @@ int main(int argc, char *argv[])
 	free_size = get_meminfo("MemFree:");
 	if (free_size < 0)
 		return 1;
+
 	size = free_size * 1.2;
 	/* Allocate a bit more to trigger swapping/OOM. */
 	bugs[i] = new(i, alloc_mmap_hotplug_memory, (void *)size,
@@ -1145,6 +1217,10 @@ int main(int argc, char *argv[])
 	bugs[i] = new(i, read_all_debugfs, NULL, "read all debugfs files.");
 	i++;
 	bugs[i] = new(i, hotplug_cpu, "", "offline and online all CPUs.");
+	i++;
+	bugs[i] = new(i, oom, NULL, "trigger normal OOM.");
+	i++;
+	bugs[i] = new(i, oom, "", "trigger NUMA OOM.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhlx:")) != -1) {
@@ -1190,6 +1266,7 @@ int main(int argc, char *argv[])
 	for (j = 0; j < i; j++) {
 		if (ignore[j])
 			continue;
+
 		code += bugs[j]->func(bugs[j]->data);
 	}
 out:
