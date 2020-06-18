@@ -349,10 +349,7 @@ static int loop_move_pages(int node1, int node2, size_t length)
 
 	addr = safe_mmap(NULL, length, PROT_READ | PROT_WRITE,
 			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-	if (addr == MAP_FAILED)
-		goto out;
-
-	if (munmap(addr, length))
+	if (addr == MAP_FAILED || munmap(addr, length))
 		goto out;
 
 	for (i = 0; i < nr_pages; i++)
@@ -394,13 +391,8 @@ static int mmap_bind_node_huge(int node, size_t length)
 		return 1;
 
 	mask[0] = 1 << node;
-	if (safe_mbind(addr, length, MPOL_BIND, mask, NR_NODE, 0))
-		return 1;
-
-	if (safe_mlock(addr, length))
-		return 1;
-
-	if (safe_munmap(addr, length))
+	if (safe_mbind(addr, length, MPOL_BIND, mask, NR_NODE, 0) ||
+	    safe_mlock(addr, length) || safe_munmap(addr, length))
 		return 1;
 
 	return 0;
@@ -451,6 +443,7 @@ static int read_file(char *path, char *buf)
 	}
 	fclose(fp);
 	close(fd);
+
 	return 0;
 }
 
@@ -633,13 +626,10 @@ static int hotplug_memory()
 		return 1;
 
 	while ((memory = readdir(dir))) {
-		if (!strcmp(memory->d_name, "."))
-			continue;
-		if (!strcmp(memory->d_name, ".."))
-			continue;
-		if (memory->d_type != DT_DIR)
-			continue;
-		if (strncmp(memory->d_name, "memory", 6))
+		if (!strcmp(memory->d_name, ".") ||
+		    !strcmp(memory->d_name, "..") ||
+		    memory->d_type != DT_DIR ||
+		    strncmp(memory->d_name, "memory", 6))
 			continue;
 
 		snprintf(path, sizeof(path), "%s/%s/online", base,
@@ -706,17 +696,13 @@ static int migrate_huge_offline(size_t free_size)
 	if (save2 < 0)
 		return 1;
 
-	if (set_node_huge(node1, save1 + 4, huge_size) < 0)
-		return 1;
-
-	if (set_node_huge(node2, save2 + 4, huge_size) < 0)
+	if (set_node_huge(node1, save1 + 4, huge_size) < 0 ||
+	    set_node_huge(node2, save2 + 4, huge_size) < 0)
 		return 1;
 
 	length = 4 * huge_size * 1024;
-	if (mmap_bind_node_huge(node1, length))
-		return 1;
-
-	if (mmap_bind_node_huge(node2, length))
+	if (mmap_bind_node_huge(node1, length) ||
+	    mmap_bind_node_huge(node2, length))
 		return 1;
 
 	length = 2 * huge_size * 1024;
@@ -739,11 +725,8 @@ static int migrate_huge_offline(size_t free_size)
 		perror("waitpid");
 		code = 1;
 	}
-	if (WIFEXITED(status))
-		code = 1;
-	if (set_node_huge(node1, save1, huge_size) < 0)
-		code = 1;
-	if (set_node_huge(node2, save2, huge_size) < 0)
+	if (WIFEXITED(status) || set_node_huge(node1, save1, huge_size) < 0 ||
+	    set_node_huge(node2, save2, huge_size) < 0)
 		code = 1;
 
 	return code;
@@ -833,10 +816,10 @@ static int read_all(const char *path)
 		return 1;
 
 	while ((entry = readdir(dir))) {
-		if (!strcmp(entry->d_name, "."))
+		if (!strcmp(entry->d_name, ".") ||
+		    !strcmp(entry->d_name, ".."))
 			continue;
-		if (!strcmp(entry->d_name, ".."))
-			continue;
+
 		snprintf(subpath, sizeof(subpath), "%s/%s", path,
 			 entry->d_name);
 
@@ -943,10 +926,7 @@ static int copy(const char *from, const char *to)
 {
 	FILE *fp = safe_fopen(to, "w");
 
-	if (!fp)
-		return 1;
-
-	if (cat(from, fp))
+	if (!fp || cat(from, fp))
 		return 1;
 
 	fclose(fp);
@@ -971,18 +951,13 @@ static int hotplug_cpu(void *data)
 		return 1;
 
 	while ((cpu = readdir(dir))) {
-		if (!strcmp(cpu->d_name, "."))
-			continue;
-		if (!strcmp(cpu->d_name, ".."))
-			continue;
-		if (cpu->d_type != DT_DIR)
-			continue;
-		if (strncmp(cpu->d_name, "cpu", 3))
-			continue;
-		if (!isdigit(cpu->d_name[3]))
-			continue;
 		/* CPU0 offline is not always possible. */
-		if (!strcmp(cpu->d_name, "cpu0"))
+		if (!strcmp(cpu->d_name, ".") ||
+		    !strcmp(cpu->d_name, "..") ||
+		    cpu->d_type != DT_DIR ||
+		    strncmp(cpu->d_name, "cpu", 3) ||
+		    !isdigit(cpu->d_name[3]) ||
+		    !strcmp(cpu->d_name, "cpu0"))
 			continue;
 
 		snprintf(path, sizeof(path), "%s/%s/online", base,
@@ -1093,19 +1068,13 @@ static int build_kernel()
 	if (cpu > 64)
 		cpu = 64;
 	snprintf(cmd, sizeof(cmd), "make -j %d 2> warn.txt", cpu);
-	if (system(cmd))
+	if (system(cmd) || system("make modules_install") ||
+	    system("make install"))
 		return 1;
 
-	if (system("make modules_install"))
-		return 1;
-
-	if (system("make install"))
-		return 1;
-
-	if (!access("./warn.txt", F_OK)) {
-		if (cat("./warn.txt", stdout))
+	if (!access("./warn.txt", F_OK) && cat("./warn.txt", stdout))
 			return 1;
-	}
+
 	return 0;
 }
 
@@ -1140,19 +1109,13 @@ static int range(char *string, bool *array, int size, bool value)
 		if (!isdigit(string[j]))
 			break;
 	}
-	if (!j)
-		goto out;
-
-	if (j != len)
+	if (!j || j != len)
 		goto out;
 
 	snprintf(buf, i + 1, string);
 	start = atoi(buf);
 	end = atoi(string + i + 1);
-	if (start >= end)
-		goto out;
-
-	if (start >= size)
+	if (start >= end || start >= size)
 		goto out;
 
 	for (; start <= end; start++)
@@ -1169,12 +1132,12 @@ static int oom(void *data)
 	int node1, node2;
 	unsigned long mask[NR_NODE] = { 0 };
 	char string[100];
+	const char *prefix = "normal";
 
 	if (data)
-		snprintf(string, sizeof(string), "%s NUMA", __func__);
-	else
-		snprintf(string, sizeof(string), __func__);
+		prefix = "NUMA";
 
+	snprintf(string, sizeof(string), "%s %s", prefix, __func__);
 	print_start(string);
 	if (data) {
 		if (get_numa(&node1, &node2))
@@ -1187,7 +1150,7 @@ static int oom(void *data)
 		}
 	}
 	alloc_mmap(0);
-	printf("- pass: %s\n", __func__);
+	printf("- pass: %s\n", string);
 
 	return 0;
 }
