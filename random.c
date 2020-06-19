@@ -88,6 +88,7 @@ static int range(char *string, bool *array, int size, bool value);
 static int oom(void *data);
 static int read_tree(void *data);
 static int run_kvm(const char *devid);
+static int run_fuzzer();
 
 static void print_start(const char *name)
 {
@@ -902,8 +903,9 @@ static void usage(const char *name)
 	fprintf(stderr, "Usage: %s %s\n%s\n", name,
 		"[-l] [-b] [-k<#devid>] [-x #bug] [#bug]",
 "-b: build kernel from linux-next.\n"
+"-f: run a syscall fuzzer at the end.\n"
 "-h: print out this text.\n"
-"-k: run KVM with optional #devid passthrough at the end.\n"
+"-k: run KVM with optional #devid passthrough after bugs.\n"
 "-l: list all bugs numbers and their descriptions.\n"
 "-x: exclude bugs by numbers.\n"
 "#bug: Trigger bugs by numbers.\n"
@@ -1288,6 +1290,65 @@ static int run_kvm(const char *devid)
 	return 0;
 }
 
+static int run_fuzzer()
+{
+	int status;
+	int cpu = hotplug_cpu(NULL);
+	char cmd[100];
+	pid_t pid;
+
+	if (cpu < 0)
+		return 1;
+
+	if (cpu > 64)
+		cpu = 64;
+
+	if (access("/usr/bin/trinity", F_OK)) {
+		if (system("git clone "
+			   "https://github.com/kernelslacker/trinity.git"))
+			return 1;
+
+		if (chdir("./trinity")) {
+			perror("chdir");
+			return 1;
+		}
+		if (system("./configure"))
+			return 1;
+
+		snprintf(cmd, sizeof(cmd), "make -j %d", cpu);
+		if (system(cmd) || system("make install"))
+			return 1;
+	}
+	/* Switch to the user ID #1000. */
+	pid = fork();
+	switch (pid) {
+	case -1:
+		perror("fork");
+		return 1;
+	case 0:
+		if (setuid(1000)) {
+			perror("setuid");
+			exit(EXIT_FAILURE);
+		}
+		if (chdir("/tmp")) {
+			perror("chdir");
+			exit(EXIT_FAILURE);
+		}
+		snprintf(cmd, sizeof(cmd), "trinity -C %d --arch 64", cpu);
+		exit(system(cmd));
+	default:
+		break;
+	}
+	if (waitpid(pid, &status, 0) < 0) {
+		perror("waitpid");
+		return 1;
+	}
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+
+	return 1;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -1300,6 +1361,7 @@ int main(int argc, char *argv[])
 	const char *devid;
 	bool ignore[NR_BUG];
 	bool kvm = false;
+	bool fuzzer = false;
 
 	free_size = get_meminfo("MemFree:");
 	if (free_size < 0)
@@ -1328,13 +1390,13 @@ int main(int argc, char *argv[])
 	bugs[i] = new(i, read_tree, "/proc", "read all procfs files.");
 	i++;
 
-	while ((c = getopt(argc, argv, "bhk::lx:")) != -1) {
+	while ((c = getopt(argc, argv, "bhfk::lx:")) != -1) {
 		switch(c) {
 		case 'b':
 			code = build_kernel();
 			goto out;
-		case 'x':
-			skip[xcount++] = optarg;
+		case 'f':
+			fuzzer = true;
 			break;
 		case 'k':
 			kvm = true;
@@ -1343,6 +1405,9 @@ int main(int argc, char *argv[])
 		case 'l':
 			list_bug(bugs);
 			goto out;
+		case 'x':
+			skip[xcount++] = optarg;
+			break;
 		case 'h': /* fall-through */
 		default:
 			usage(argv[0]);
@@ -1380,6 +1445,9 @@ int main(int argc, char *argv[])
 	}
 	if (kvm)
 		code += run_kvm(devid);
+
+	if (fuzzer && !code)
+		code = run_fuzzer();
 out:
 	for (j = 0; j < i; j++)
 		delete(bugs[j]);
