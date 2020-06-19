@@ -59,15 +59,15 @@ static FILE *safe_fdopen(int fd, const char *mode);
 static struct bug *new(int number, int (* func)(void *data), void *data,
 		       char *string);
 static void delete(struct bug *bug);
-static size_t get_meminfo(char *field);
+static size_t get_meminfo(const char *field);
 static long set_node_huge(int node, long size, size_t huge_size);
 static int mmap_offline_node_huge(size_t length);
 static int loop_move_pages(int node1, int node2, size_t length);
 static int mmap_bind_node_huge(int node, size_t length);
 static int get_numa(int *node1, int *node2);
-static int read_file(char *path, char *buf);
-static long read_value(char *path);
-static int write_value(char *path, long value);
+static int read_file(const char *path, char *buf, size_t size);
+static long read_value(const char *path);
+static int write_file(const char *path, char *buf, size_t size);
 static int scan_ksm();
 static void *thread_mmap(void *data);
 static void loop_mmap(size_t length);
@@ -87,6 +87,7 @@ static int build_kernel();
 static int range(char *string, bool *array, int size, bool value);
 static int oom(void *data);
 static int read_tree(void *data);
+static int run_kvm(const char *devid);
 
 static void print_start(const char *name)
 {
@@ -244,7 +245,7 @@ static void delete(struct bug *bug)
 	free(bug);
 }
 
-static size_t get_meminfo(char *field)
+static size_t get_meminfo(const char *field)
 {
 	FILE *fp = safe_fopen("/proc/meminfo", "r");
 	char *line = NULL;
@@ -424,7 +425,7 @@ static int get_numa(int *node1, int *node2)
 	return 0;
 }
 
-static int read_file(char *path, char *buf)
+static int read_file(const char *path, char *buf, size_t size)
 {
 	int fd = safe_open(path, O_RDONLY | O_NONBLOCK);
 	FILE *fp;
@@ -436,7 +437,7 @@ static int read_file(char *path, char *buf)
 	if (!fp)
 		return 1;
 
-	fread(buf, sizeof(buf), 1, fp);
+	fread(buf, size, 1, fp);
 	if (safe_ferror(fp, path)) {
 		close(fd);
 		return 1;
@@ -447,26 +448,25 @@ static int read_file(char *path, char *buf)
 	return 0;
 }
 
-static long read_value(char *path)
+static long read_value(const char *path)
 {
 	char value[1024];
 
-	if (read_file(path, value))
+	if (read_file(path, value, sizeof(value)))
 		return -1;
 
 	return atol(value);
 }
 
-static int write_value(char *path, long value)
+static int write_file(const char *path, char *buf, size_t size)
 {
 	FILE *fp = safe_fopen(path, "w");
-	char s[100];
 
 	if (!fp)
 		return -1;
 
-	snprintf(s, sizeof(s), "%ld", value);
-	fwrite(s, sizeof(s), 1, fp);
+	assert(buf);
+	fwrite(buf, size, 1, fp);
 	fflush(fp);
 	if (safe_ferror(fp, __func__))
 		return 1;
@@ -741,6 +741,7 @@ static int migrate_ksm(void *data)
 	void *pages[NR_PAGE];
 	unsigned long mask1[NR_NODE] = { 0 };
 	unsigned long mask2[NR_NODE] = { 0 };
+	char buf[100];
 
 	print_start(__func__);
 	if (get_numa(&node1, &node2))
@@ -789,7 +790,8 @@ static int migrate_ksm(void *data)
 		goto pass;
 
 	/* Restore. */
-	if (write_value("/sys/kernel/mm/ksm/run", run))
+	snprintf(buf, sizeof(buf), "%ld", run);
+	if (write_file("/sys/kernel/mm/ksm/run", buf, strlen(buf)))
 		return 1;
 pass:
 	printf("- pass: %s\n", __func__);
@@ -841,11 +843,11 @@ static int read_all(const char *path)
 			case S_IFLNK:
 				continue;
 			default:
-				read_file(subpath, buf);
+				read_file(subpath, buf, sizeof(buf));
 			}
 			break;
 		default:
-			read_file(subpath, buf);
+			read_file(subpath, buf, sizeof(buf));
 		}
 	}
 	closedir(dir);
@@ -898,12 +900,13 @@ static void list_bug(struct bug *bugs[])
 static void usage(const char *name)
 {
 	fprintf(stderr, "Usage: %s %s\n%s\n", name,
-		"[-l] [-b] [-x #bug] [#bug]",
+		"[-l] [-b] [-k<#devid>] [-x #bug] [#bug]",
 "-b: build kernel from linux-next.\n"
 "-h: print out this text.\n"
+"-k: run KVM with optional #devid passthrough at the end.\n"
 "-l: list all bugs numbers and their descriptions.\n"
 "-x: exclude bugs by numbers.\n"
-"Trigger bugs by numbers.\n"
+"#bug: Trigger bugs by numbers.\n"
 "#bug can be specified multiple times and used as a range, e.g., 0-3");
 }
 
@@ -1010,7 +1013,7 @@ static int build_kernel()
 
 	if (system("rpm -q ncurses-devel") &&
 	    system("dnf -y install openssl-devel bc bison flex patch "
-		   "ncurses-devel elfutils-libelf-devel"))
+		   "ncurses-devel elfutils-libelf-devel qemu-kvm genisoimage"))
 			return 1;
 
 	dir = opendir("./linux-next");
@@ -1155,6 +1158,136 @@ static int oom(void *data)
 	return 0;
 }
 
+static int run_kvm(const char *devid)
+{
+	const char *distro = "ubuntu-20.04-server-cloudimg";
+	const char *bios = "";
+	const char *vfio = "/sys/bus/pci/drivers/vfio-pci";
+	const char *prefix;
+	struct utsname uts;
+	char buf[1024], name[1024];
+	char qcow2[100], image[100], iso[100], vendor[100], device[100];
+	char sysfs[100];
+	char sriov[100] = "";
+	char driver[PATH_MAX];
+	ssize_t size;
+
+	if (uname(&uts)) {
+		perror("uname");
+		return 1;
+	}
+	if (!strcmp(uts.machine, "x86_64")) {
+		prefix = "amd64";
+	} else if (!strcmp(uts.machine, "aarch64")) {
+		prefix = "arm64";
+		bios = "-bios /usr/share/AAVMF/AAVMF_CODE.fd "
+		       "-M gic-version=host";
+	} else if (!strcmp(uts.machine, "ppc64le")) {
+		prefix = "ppc64el";
+	} else {
+		prefix = uts.machine;
+	}
+	snprintf(image, sizeof(image), "./%s-%s.img", distro, prefix);
+	snprintf(qcow2, sizeof(buf), "./%s.qcow2", distro);
+	prefix = "https://cloud-images.ubuntu.com/releases/focal/release/";
+	if (access(qcow2, F_OK)) {
+		if (access(image, F_OK)) {
+			snprintf(buf, sizeof(buf), "curl -O %s/%s", prefix,
+				 image);
+			if (system(buf))
+				return 1;
+		}
+		snprintf(buf, sizeof(buf),
+			 "qemu-img create -b %s -f qcow2 %s 1T", image, qcow2);
+		if (system(buf))
+			return 1;
+	}
+	snprintf(iso, sizeof(iso), "./%s.iso", distro);
+	if (access(iso, F_OK)) {
+		snprintf(buf, sizeof(buf), "instance-id: %s\n"
+			 "local-hostname: %s\n", distro, distro);
+		if (write_file("./meta-data", buf, strlen(buf)))
+			return 1;
+
+		snprintf(buf, sizeof(buf), "#cloud-config\npassword: %s\n"
+			 "chpasswd: { expire: False }\nssh_pwauth: True\n",
+			 distro);
+		if (write_file("./user-data", buf, strlen(buf)))
+			return 1;
+
+		snprintf(buf, sizeof(buf), "genisoimage -output %s "
+			 "-volid cidata -joliet -rock user-data meta-data",
+			 iso);
+		if (system(buf))
+			return 1;
+	}
+	snprintf(sysfs, sizeof(sysfs), "/sys/bus/pci/devices/%s", devid);
+	snprintf(name, sizeof(name), "%s/reset", sysfs);
+	if (devid && !access(name, F_OK)) {
+		if (system("modprobe vfio-pci"))
+			return 1;
+
+		/* Save the driver name to restore later if possible. */
+		snprintf(name, sizeof(name), "%s/driver", sysfs);
+		size = readlink(name, driver, sizeof(driver));
+		if (size < 0) {
+			perror("readlink");
+			return 1;
+		}
+		snprintf(name, sizeof(name), "%s/vendor", sysfs);
+		if (read_file(name, vendor, sizeof(vendor)))
+			return 1;
+
+		snprintf(name, sizeof(name), "%s/device", sysfs);
+		if (read_file(name, device, sizeof(device)))
+			return 1;
+
+		/* Have to remove the leading "0x" first. */
+		snprintf(buf, sizeof(buf), "%s %s", vendor + 2, device + 2);
+		snprintf(name, sizeof(name), "%s/new_id", vfio);
+		/* Write to the "new_id" will flip the driver to vfio-pci. */
+		if (write_file(name, buf, strlen(buf)))
+			return 1;
+
+		snprintf(name, sizeof(name), "%s/driver/unbind", sysfs);
+		if (write_file(name, (char *)devid, strlen(devid)))
+			return 1;
+
+		snprintf(name, sizeof(name), "%s/bind", vfio);
+		if (write_file(name, (char *)devid, strlen(devid)))
+			return 1;
+
+		snprintf(sriov, sizeof(sriov), "-device vfio-pci,host=%s",
+			 devid);
+	}
+	snprintf(buf, sizeof(buf), "/usr/libexec/qemu-kvm -name %s -cpu host "
+		 "-smp 2 -m 2g -hda %s -cdrom %s %s "
+		 "-nic user,hostfwd=tcp::2222-:22 -nographic %s", distro,
+		 qcow2, iso, bios, sriov);
+	printf("- info: %s\n", buf);
+	if (system(buf))
+		return 1;
+
+	if (strlen(sriov)) {
+		snprintf(buf, sizeof(buf), "%s %s", vendor + 2, device + 2);
+		snprintf(name, sizeof(name), "%s/remove_id", vfio);
+		if (write_file(name, buf, strlen(buf)))
+			return 1;
+
+		snprintf(name, sizeof(name), "%s/unbind", vfio);
+		if (write_file(name, (char *)devid, strlen(devid)))
+			return 1;
+
+		/*
+		 * To restore,
+		 * # echo "$devid" > "/sys/bus/pci/drivers/$driver/bind"
+		 * # echo 0 > /sys/class/net/<ifname>/device/sriov_numvfs
+		 */
+		printf("- info: driver = %.*s\n", (int)size, driver);
+	}
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -1164,7 +1297,9 @@ int main(int argc, char *argv[])
 	int xcount = 0;
 	struct bug *bugs[NR_BUG] = { NULL };
 	char *skip[100] = { NULL };
+	const char *devid;
 	bool ignore[NR_BUG];
+	bool kvm = false;
 
 	free_size = get_meminfo("MemFree:");
 	if (free_size < 0)
@@ -1193,13 +1328,17 @@ int main(int argc, char *argv[])
 	bugs[i] = new(i, read_tree, "/proc", "read all procfs files.");
 	i++;
 
-	while ((c = getopt(argc, argv, "bhlx:")) != -1) {
+	while ((c = getopt(argc, argv, "bhk::lx:")) != -1) {
 		switch(c) {
 		case 'b':
 			code = build_kernel();
 			goto out;
 		case 'x':
 			skip[xcount++] = optarg;
+			break;
+		case 'k':
+			kvm = true;
+			devid = optarg;
 			break;
 		case 'l':
 			list_bug(bugs);
@@ -1239,6 +1378,8 @@ int main(int argc, char *argv[])
 
 		code += bugs[j]->func(bugs[j]->data);
 	}
+	if (kvm)
+		code += run_kvm(devid);
 out:
 	for (j = 0; j < i; j++)
 		delete(bugs[j]);
