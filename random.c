@@ -15,7 +15,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/ipc.h>
 #include <sys/mman.h>
+#include <sys/sem.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -89,6 +91,11 @@ static int oom(void *data);
 static int read_tree(void *data);
 static int run_kvm(const char *devid);
 static int run_fuzzer();
+static int safe_chdir(const char *path);
+static int safe_waitpid(pid_t pid, int *status, int options);
+static int cap_cpu();
+static pid_t safe_fork();
+static int fill_semget(void *data);
 
 static void print_start(const char *name)
 {
@@ -262,7 +269,7 @@ static size_t get_meminfo(const char *field)
 		if (!strcmp(field, key))
 			goto out;
 	}
-	fprintf(stderr, "- fail: no %s in meminfo.\n", field);
+	fprintf(stderr, "- error getting %s in meminfo.\n", field);
 out:
 	free(line);
 	fclose(fp);
@@ -385,7 +392,7 @@ static int mmap_bind_node_huge(int node, size_t length)
 	void *addr;
 	unsigned long mask[NR_NODE] = { 0 };
 
-	printf("- info: mmap and free %zu bytes hugepages on node %d\n",
+	printf("- mmap and free %zu bytes hugepages on node %d\n",
 	       length, node);
 	addr = safe_mmap(NULL, length, PROT_READ | PROT_WRITE,
 			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
@@ -408,7 +415,7 @@ static int get_numa(int *node1, int *node2)
 
 	fp = safe_fopen("/sys/devices/system/node/has_memory", "r");
 	if (!fp) {
-		fprintf(stderr, "- fail: it requires NUMA nodes.\n");
+		fprintf(stderr, "- error requiring NUMA nodes.\n");
 		return 1;
 	}
 	*node1 = -1;
@@ -419,10 +426,10 @@ static int get_numa(int *node1, int *node2)
 	fclose(fp);
 
 	if (*node1 == -1 || *node2 == -1) {
-		fprintf(stderr, "- fail: it requires 2 NUMA nodes.\n");
+		fprintf(stderr, "- error requiring 2 NUMA nodes.\n");
 		return 1;
 	}
-	printf("- info: use NUMA nodes %d,%d.\n", *node1, *node2);
+	printf("- use NUMA nodes %d,%d.\n", *node1, *node2);
 	return 0;
 }
 
@@ -525,7 +532,7 @@ static int scan_ksm()
 		if (scans < 0)
 			goto out;
 	}
-	printf("- info: KSM takes %ds to run two full scans.\n", count);
+	printf("- KSM takes %ds to run two full scans.\n", count);
 	return run;
 out:
 	snprintf(value, sizeof(value), "%d", run);
@@ -570,10 +577,10 @@ static void loop_mmap(size_t length)
 
 	for (i = 0; i < NR_THREAD; i++) {
 		if (length)
-			printf("- info: mmap %d%% memory: %zu\n",
+			printf("- mmap %d%% memory: %zu\n",
 			       100 / NR_THREAD, size);
 		else
-			printf("- info: mmap memory: %zu\n", size);
+			printf("- mmap memory: %zu\n", size);
 
 		if (pthread_create(&thread[i], NULL, thread_mmap,
 				   (void *)size))
@@ -589,6 +596,17 @@ static void loop_mmap(size_t length)
 	free(thread);
 }
 
+static pid_t safe_fork()
+{
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0)
+		perror("fork");
+
+	return pid;
+}
+
 /* Allocate memory and mmap them. */
 static int alloc_mmap(size_t length)
 {
@@ -597,17 +615,19 @@ static int alloc_mmap(size_t length)
 	if (length)
 		print_start(__func__);
 
-	switch(pid = fork()) {
+	pid = safe_fork();
+	switch(pid) {
+	case -1:
+		return 1;
 	case 0:
 		loop_mmap(length * 1024);
 		exit(EXIT_SUCCESS);
-	case -1:
-		perror("- fail: fork");
-		return 1;
 	default:
 		break;
 	}
-	wait(NULL);
+	if (safe_waitpid(pid, NULL, 0) < 0)
+		return 1;
+
 	return 0;
 }
 
@@ -686,7 +706,7 @@ static int migrate_huge_offline(size_t free_size)
 	/* 4 pages are required to trigger the bug. */
 	if (8 * huge_size > free_size) {
 		fprintf(stderr,
-			"- fail: not enough memory for 8 hugepages.\n");
+			"- error allocating memory for 8 hugepages.\n");
 		return 1;
 	}
 	save1 = set_node_huge(node1, -1, huge_size);
@@ -707,12 +727,12 @@ static int migrate_huge_offline(size_t free_size)
 		return 1;
 
 	length = 2 * huge_size * 1024;
-	switch(pid = fork()) {
+	pid = safe_fork();
+	switch(pid) {
+	case -1:
+		return 1;
 	case 0:
 		exit(loop_move_pages(node1, node2, length));
-	case -1:
-		perror("- fail: fork");
-		return 1;
 	default:
 		break;
 	}
@@ -722,10 +742,9 @@ static int migrate_huge_offline(size_t free_size)
 		perror("kill");
 		code = 1;
 	}
-	if (waitpid(pid, &status, 0) < 0) {
-		perror("waitpid");
+	if (safe_waitpid(pid, &status, 0) < 0)
 		code = 1;
-	}
+
 	if (WIFEXITED(status) || set_node_huge(node1, save1, huge_size) < 0 ||
 	    set_node_huge(node2, save2, huge_size) < 0)
 		code = 1;
@@ -769,7 +788,7 @@ static int migrate_ksm(void *data)
 	if (run < 0)
 		goto out;
 
-	printf("- info: call migrate_pages() repetitively.\n");
+	printf("- call migrate_pages() repetitively.\n");
 	for (m = 0; m < NR_LOOP; m++) {
 		int n = m % 2;
 
@@ -814,7 +833,7 @@ static int read_all(const char *path)
 	static unsigned long count = 0;
 
 	if (!(count++ % 10))
-		printf("- info: %s\n", path);
+		printf("- %s\n", path);
 	if (!dir)
 		return 1;
 
@@ -1008,7 +1027,7 @@ static int build_kernel()
 	struct utsname uts;
 	char cmd[1024], *prefix;
 	char *diff = "/tmp/test.patch";
-	int cpu = hotplug_cpu(NULL);
+	int cpu = cap_cpu();
 
 	if (cpu < 1)
 		return 1;
@@ -1024,10 +1043,9 @@ static int build_kernel()
 			return 1;
 
 	closedir(dir);
-	if (chdir("./linux-next")) {
-		perror("chdir");
+	if (safe_chdir("./linux-next"))
 		return 1;
-	}
+
 	if(access(".config", F_OK)) {
 		if (uname(&uts)) {
 			perror("uname");
@@ -1042,7 +1060,7 @@ static int build_kernel()
 		} else if (!strcmp(uts.machine, "s390x")) {
 			prefix="s390";
 		} else {
-			fprintf(stderr, "- error: unsupported arch %s.\n",
+			fprintf(stderr, "- error supporting arch %s.\n",
 				uts.machine);
 			return 1;
 		}
@@ -1069,9 +1087,6 @@ static int build_kernel()
 		if (copy("./warn.txt", "./warn.txt.orig"))
 			return 1;
 	}
-	/* There is no guarantee a higher thread number will be faster. */
-	if (cpu > 64)
-		cpu = 64;
 	snprintf(cmd, sizeof(cmd), "make -j %d 2> warn.txt", cpu);
 	if (system(cmd) || system("make modules_install") ||
 	    system("make install"))
@@ -1128,7 +1143,7 @@ static int range(char *string, bool *array, int size, bool value)
 
 	return 0;
 out:
-	fprintf(stderr, "- error: invalid #bug or format\n");
+	fprintf(stderr, "- error parsing #bug or format.\n");
 	return 1;
 }
 
@@ -1266,7 +1281,7 @@ static int run_kvm(const char *devid)
 		 "-smp 2 -m 2g -hda %s -cdrom %s %s "
 		 "-nic user,hostfwd=tcp::2222-:22 -nographic %s", distro,
 		 qcow2, iso, bios, sriov);
-	printf("- info: %s\n", buf);
+	printf("- %s\n", buf);
 	if (system(buf))
 		return 1;
 
@@ -1285,7 +1300,7 @@ static int run_kvm(const char *devid)
 		 * # echo "$devid" > "/sys/bus/pci/drivers/$driver/bind"
 		 * # echo 0 > /sys/class/net/<ifname>/device/sriov_numvfs
 		 */
-		printf("- info: driver = %.*s\n", (int)size, driver);
+		printf("- driver is %.*s\n.", (int)size, driver);
 	}
 	return 0;
 }
@@ -1293,25 +1308,21 @@ static int run_kvm(const char *devid)
 static int run_fuzzer()
 {
 	int status;
-	int cpu = hotplug_cpu(NULL);
+	int cpu = cap_cpu();
 	char cmd[100];
 	pid_t pid;
 
 	if (cpu < 0)
 		return 1;
 
-	if (cpu > 64)
-		cpu = 64;
-
 	if (access("/usr/bin/trinity", F_OK)) {
 		if (system("git clone "
 			   "https://github.com/kernelslacker/trinity.git"))
 			return 1;
 
-		if (chdir("./trinity")) {
-			perror("chdir");
+		if (safe_chdir("./trinity"))
 			return 1;
-		}
+
 		if (system("./configure"))
 			return 1;
 
@@ -1320,33 +1331,111 @@ static int run_fuzzer()
 			return 1;
 	}
 	/* Switch to the user ID #1000. */
-	pid = fork();
+	pid = safe_fork();
 	switch (pid) {
 	case -1:
-		perror("fork");
 		return 1;
 	case 0:
 		if (setuid(1000)) {
 			perror("setuid");
 			exit(EXIT_FAILURE);
 		}
-		if (chdir("/tmp")) {
-			perror("chdir");
+		if (safe_chdir("/tmp"))
 			exit(EXIT_FAILURE);
-		}
+
 		snprintf(cmd, sizeof(cmd), "trinity -C %d --arch 64", cpu);
 		exit(system(cmd));
 	default:
 		break;
 	}
-	if (waitpid(pid, &status, 0) < 0) {
-		perror("waitpid");
+	if (safe_waitpid(pid, &status, 0) < 0)
 		return 1;
-	}
+
 	if (WIFEXITED(status))
 		return WEXITSTATUS(status);
 
 	return 1;
+}
+
+static int safe_chdir(const char *path)
+{
+	if (chdir(path)) {
+		perror("chdir");
+		return 1;
+	}
+	return 0;
+}
+
+static pid_t safe_waitpid(pid_t pid, int *status, int options)
+{
+	pid_t code = waitpid(pid, status, options);
+
+	if (code < 0)
+		perror("waitpid");
+
+	return code;
+}
+
+static int cap_cpu()
+{
+	int cpu = hotplug_cpu(NULL);
+
+	/*
+	 * There is no guarantee a higher thread number will be faster for
+	 * parallel compilations.
+	 */
+	if (cpu > 64)
+		cpu = 64;
+
+	return cpu;
+}
+
+static int fill_semget(void *data)
+{
+	int *semid_arr;
+	int semid, i, max;
+	int total = 0;
+	int code = 0;
+	FILE *fp = safe_fopen("/proc/sys/kernel/sem", "r");
+
+	print_start(__func__);
+	if (!fp)
+		return 1;
+
+	if (fscanf(fp, "%*d %*d %*d %d", &max) != 1) {
+		fprintf(stderr, "- error getting SEMMNI.");
+		fclose(fp);
+		return 1;
+	}
+	semid_arr = safe_malloc(sizeof(int) * (max + 1));
+	if (!semid_arr)
+		return 1;
+
+	while ((semid = semget(IPC_PRIVATE, 10, IPC_CREAT | IPC_EXCL))
+	       != -1) {
+		semid_arr[total++] = semid;
+		if (total == max + 1) {
+			fprintf(stderr, "- error reaching SEMMNI.");
+			code = 1;
+			goto out;
+		}
+	}
+
+	if (errno != ENOSPC) {
+		fprintf(stderr, "- error not returning ENOSPC.");
+		code = 1;
+	}
+out:
+	for (i = 0; i < total; i++) {
+		if (semctl(semid_arr[i], 0, IPC_RMID)) {
+			perror("semctl IPC_RMID");
+			code = 1;
+		}
+	}
+	if (!code)
+		printf("- pass: %s\n", __func__);
+
+	return code;
 }
 
 int main(int argc, char *argv[])
@@ -1389,6 +1478,9 @@ int main(int argc, char *argv[])
 	i++;
 	bugs[i] = new(i, read_tree, "/proc", "read all procfs files.");
 	i++;
+	bugs[i] = new(i, fill_semget, NULL,
+		"force semget() to return ENOSPC.");
+	i++;
 
 	while ((c = getopt(argc, argv, "bhfk::lx:")) != -1) {
 		switch(c) {
@@ -1418,7 +1510,7 @@ int main(int argc, char *argv[])
 	if (optind < argc) {
 		if (xcount) {
 			fprintf(stderr,
-				"- error: has both [-x #bug] and [#bug].\n");
+				"- error having both [-x #bug] and [#bug].\n");
 			code += 1;
 			goto out;
 		}
