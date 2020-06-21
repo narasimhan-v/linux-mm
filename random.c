@@ -1432,6 +1432,7 @@ out:
 			code = 1;
 		}
 	}
+	free(semid_arr);
 	if (!code)
 		printf("- pass: %s\n", __func__);
 
