@@ -40,62 +40,65 @@ struct bug {
 	char *string;
 };
 
+static int alloc_mmap(size_t length);
+static int alloc_mmap_hotplug_memory(void *data);
+static struct bug *new(int number, int (* func)(void *data), void *data,
+		       char *string);
+static int build_kernel();
+static int cap_cpu();
+static int cat(const char *from, FILE *fp_to);
+static int copy(const char *from, const char *to);
+static void delete(struct bug *bug);
+static int fill_semget(void *data);
+static size_t get_meminfo(const char *field);
+static int get_numa(int *node1, int *node2);
+static int hotplug_cpu(void *data);
+static int hotplug_memory();
+static void list_bug(struct bug *bugs[]);
+static void loop_mmap(size_t length);
+static int loop_move_pages(int node1, int node2, size_t length);
+static int migrate_huge_hotplug_memory(void *data);
+static int migrate_huge_offline(size_t free_size);
+static int migrate_ksm(void *data);
+static int mmap_bind_node_huge(int node, size_t length);
+static int mmap_hugetlbfs(void *data);
+static int mmap_offline_node_huge(size_t length);
+static int oom(void *data);
 static void print_start(const char *name);
-static void *safe_malloc(size_t length);
-static DIR *safe_opendir(const char *path);
+static int range(char *string, bool *array, int size, bool value);
+static int read_all(const char *path);
+static int read_file(const char *path, char *buf, size_t size);
+static int read_tree(void *data);
+static long read_value(const char *path);
+static int run_fuzzer();
+static int run_kvm(const char *devid);
+static int safe_chdir(const char *path);
+static FILE *safe_fdopen(int fd, const char *mode);
+static pid_t safe_fork();
+static int safe_ferror(FILE *fp, const char *reason);
 static FILE *safe_fopen(const char *path, const char *mode);
-static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
-		       off_t offset);
-static int safe_munmap(void *addr, size_t length);
+static int safe_lstat(const char *path, struct stat *stat);
+static void *safe_malloc(size_t length);
 static long safe_mbind(void *addr, unsigned long length, int mode,
 		       const unsigned long *nodemask, unsigned long maxnode,
 		       unsigned flags);
+static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
+		       off_t offset);
+static int safe_munmap(void *addr, size_t length);
 static int safe_mlock(const void *addr, size_t length);
 static long safe_migrate_pages(int pid, unsigned long max_node,
 			       const unsigned long *old_nodes,
 			       const unsigned long *new_nodes);
-static int safe_ferror(FILE *fp, const char *reason);
-static int safe_lstat(const char *path, struct stat *stat);
+static DIR *safe_opendir(const char *path);
 static int safe_open(const char *path, int flags);
-static FILE *safe_fdopen(int fd, const char *mode);
-static struct bug *new(int number, int (* func)(void *data), void *data,
-		       char *string);
-static void delete(struct bug *bug);
-static size_t get_meminfo(const char *field);
-static long set_node_huge(int node, long size, size_t huge_size);
-static int mmap_offline_node_huge(size_t length);
-static int loop_move_pages(int node1, int node2, size_t length);
-static int mmap_bind_node_huge(int node, size_t length);
-static int get_numa(int *node1, int *node2);
-static int read_file(const char *path, char *buf, size_t size);
-static long read_value(const char *path);
-static int write_file(const char *path, char *buf, size_t size);
-static int scan_ksm();
-static void *thread_mmap(void *data);
-static void loop_mmap(size_t length);
-static int alloc_mmap(size_t length);
-static int hotplug_memory();
-static int migrate_huge_offline(size_t free_size);
-static int migrate_ksm(void *data);
-static int read_all(const char *path);
-static int alloc_mmap_hotplug_memory(void *data);
-static int migrate_huge_hotplug_memory(void *data);
-static void list_bug(struct bug *bugs[]);
-static void usage(const char *name);
-static int cat(const char *from, FILE *fp_to);
-static int copy(const char *from, const char *to);
-static int hotplug_cpu(void *data);
-static int build_kernel();
-static int range(char *string, bool *array, int size, bool value);
-static int oom(void *data);
-static int read_tree(void *data);
-static int run_kvm(const char *devid);
-static int run_fuzzer();
-static int safe_chdir(const char *path);
+static int safe_unlink(const char *path);
 static int safe_waitpid(pid_t pid, int *status, int options);
-static int cap_cpu();
-static pid_t safe_fork();
-static int fill_semget(void *data);
+static int scan_ksm();
+static long set_node_huge(int node, long size, size_t huge_size);
+static void *thread_mmap(void *data);
+static void usage(const char *name);
+static int write_file(const char *path, char *buf, size_t size);
+static int write_value(const char *path, long value);
 
 static void print_start(const char *name)
 {
@@ -761,7 +764,6 @@ static int migrate_ksm(void *data)
 	void *pages[NR_PAGE];
 	unsigned long mask1[NR_NODE] = { 0 };
 	unsigned long mask2[NR_NODE] = { 0 };
-	char buf[100];
 
 	print_start(__func__);
 	if (get_numa(&node1, &node2))
@@ -771,7 +773,7 @@ static int migrate_ksm(void *data)
 		pages[i] = safe_mmap(NULL, pagesz, PROT_READ | PROT_WRITE |
 				     PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
 				     -1, 0);
-		if (!pages[i])
+		if (pages[i] == MAP_FAILED)
 			goto out;
 
 		if (madvise(pages[i], pagesz, MADV_MERGEABLE) < 0) {
@@ -810,8 +812,7 @@ static int migrate_ksm(void *data)
 		goto pass;
 
 	/* Restore. */
-	snprintf(buf, sizeof(buf), "%ld", run);
-	if (write_file("/sys/kernel/mm/ksm/run", buf, strlen(buf)))
+	if (write_value("/sys/kernel/mm/ksm/run", run))
 		return 1;
 pass:
 	printf("- pass: %s\n", __func__);
@@ -1439,6 +1440,73 @@ out:
 	return code;
 }
 
+static int mmap_hugetlbfs(void *data)
+{
+	int fd;
+	char *mount = "/dev/hugepages";
+	char *nr_huge = "/proc/sys/vm/nr_hugepages";
+	char name[100];
+	size_t huge_size, curr;
+	long save;
+	void *addr;
+
+	print_start(__func__);
+	snprintf(name, sizeof(name), "%s/mmapfile%d", mount, getpid());
+	fd = safe_open(name, O_RDWR | O_CREAT);
+	if (fd < 0)
+		return 1;
+
+	save = read_value(nr_huge);
+	if (save < 0 || write_value(nr_huge, (long)data))
+		return 1;
+
+	huge_size = get_meminfo("Hugepagesize:");
+	if (huge_size < 0)
+		return 1;
+
+	huge_size *= 1024;
+	addr = safe_mmap(NULL, huge_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			 fd, 0);
+	if (addr == MAP_FAILED)
+		return 1;
+
+	/* Force to allocate page and change HugePages_Free. */
+	*(int *)addr = 0;
+	curr = get_meminfo("HugePages_Free:");
+	if (curr != (long)data - 1) {
+		fprintf(stderr, "- error nr_hugepages is %ld.\n", curr);
+		return 1;
+	}
+
+	if (safe_munmap(addr, huge_size) || write_value(nr_huge, save))
+		return 1;
+
+	close(fd);
+	if (safe_unlink(name))
+		return 1;
+
+	printf("- pass: %s\n", __func__);
+	return 0;
+}
+
+static int write_value(const char *path, long value)
+{
+	char buf[100];
+
+	snprintf(buf, sizeof(buf), "%ld", value);
+	return write_file(path, buf, strlen(buf));
+}
+
+static int safe_unlink(const char *path)
+{
+	int code = unlink(path);
+
+	if (code)
+		perror("unlink");
+
+	return code;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -1481,6 +1549,9 @@ int main(int argc, char *argv[])
 	i++;
 	bugs[i] = new(i, fill_semget, NULL,
 		"force semget() to return ENOSPC.");
+	i++;
+	bugs[i] = new(i, mmap_hugetlbfs, (void *)128,
+		"mmap a file in hugetlbfs.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhfk::lx:")) != -1) {
