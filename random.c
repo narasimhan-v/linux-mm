@@ -1553,7 +1553,7 @@ int main(int argc, char *argv[])
 	bugs[i] = new(i, fill_semget, NULL,
 		"force semget() to return ENOSPC.");
 	i++;
-	bugs[i] = new(i, mmap_hugetlbfs, (void *)128,
+	bugs[i] = new(i, mmap_hugetlbfs, (void *)64,
 		"mmap a file in hugetlbfs.");
 	i++;
 
