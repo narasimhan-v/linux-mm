@@ -1188,7 +1188,7 @@ static int run_kvm(const char *devid)
 	char sysfs[100];
 	char sriov[100] = "";
 	char driver[PATH_MAX];
-	ssize_t size;
+	ssize_t size = 0;
 
 	if (uname(&uts)) {
 		perror("uname");
@@ -1247,10 +1247,13 @@ static int run_kvm(const char *devid)
 
 		/* Save the driver name to restore later if possible. */
 		snprintf(name, sizeof(name), "%s/driver", sysfs);
-		size = readlink(name, driver, sizeof(driver));
-		if (size < 0) {
-			perror("readlink");
-			return 1;
+		/* It is possible the device has no driver to begin with. */
+		if (!access(name, F_OK)) {
+			size = readlink(name, driver, sizeof(driver));
+			if (size < 0) {
+				perror("readlink");
+				return 1;
+			}
 		}
 		snprintf(name, sizeof(name), "%s/vendor", sysfs);
 		if (read_file(name, vendor, sizeof(vendor)))
@@ -1295,13 +1298,13 @@ static int run_kvm(const char *devid)
 		snprintf(name, sizeof(name), "%s/unbind", vfio);
 		if (write_file(name, (char *)devid, strlen(devid)))
 			return 1;
-
 		/*
 		 * To restore,
 		 * # echo "$devid" > "/sys/bus/pci/drivers/$driver/bind"
 		 * # echo 0 > /sys/class/net/<ifname>/device/sriov_numvfs
 		 */
-		printf("- driver is %.*s\n.", (int)size, driver);
+		if (size)
+			printf("- driver is %.*s\n.", (int)size, driver);
 	}
 	return 0;
 }
