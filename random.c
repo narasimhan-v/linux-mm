@@ -1038,7 +1038,7 @@ static int build_kernel()
 	if (system("rpm -q ncurses-devel") &&
 	    system("dnf -y install openssl-devel bc bison flex patch "
 		   "ncurses-devel elfutils-libelf-devel qemu-kvm genisoimage "
-		   "runc"))
+		   "runc glibc-static"))
 			return 1;
 
 	dir = opendir("./linux-next");
@@ -1518,7 +1518,7 @@ static int safe_unlink(const char *path)
 static int runc(void *data)
 {
 	const char *spec_file = "\
-  {\n\
+{\n\
 	\"ociVersion\": \"1.0.0\",\n\
 	\"process\": {\n\
 		\"terminal\": false,\n\
@@ -1527,7 +1527,7 @@ static int runc(void *data)
 			\"gid\": 0\n\
 		},\n\
 		\"args\": [\n\
-			\"date\"\n\
+			\"hello\"\n\
 		],\n\
 		\"env\": [\n\
 			\"PATH=/usr/sbin:/usr/bin:/sbin:/bin\",\n\
@@ -1648,6 +1648,15 @@ static int runc(void *data)
 				\"relatime\",\n\
 				\"ro\"\n\
 			]\n\
+		},\n\
+		{\n\
+			\"destination\": \"/usr/bin/hello\",\n\
+			\"type\": \"bind\",\n\
+			\"source\": \"./hello\",\n\
+			\"options\": [\n\
+				\"rbind\",\n\
+				\"ro\"\n\
+			]\n\
 		}\n\
 	],\n\
 	\"linux\": {\n\
@@ -1691,6 +1700,14 @@ static int runc(void *data)
 		]\n\
 	}\n\
 }\n";
+	const char *hello = "\
+#include <stdio.h>\n\
+\n\
+int main()\n\
+{\n\
+	printf(\"Hello, World!\\n\");\n\
+	return 0;\n\
+}\n";
 	DIR *dir = opendir("./rootfs");
 
 	print_start(__func__);
@@ -1701,11 +1718,11 @@ static int runc(void *data)
 		closedir(dir);
 
 	if (write_file("./config.json", (char *)spec_file,
-		       strlen(spec_file)))
+		       strlen(spec_file)) ||
+	    write_file("./hello.c", (char *)hello, strlen(hello)) ||
+	    system("gcc -static -o hello hello.c") || system("runc run root"))
 		return 1;
 
-	/* Do not care about errors. */
-	system("runc run root");
 	printf("- pass: %s\n", __func__);
 
 	return 0;
