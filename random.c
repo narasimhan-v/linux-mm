@@ -70,6 +70,7 @@ static int read_all(const char *path);
 static int read_file(const char *path, char *buf, size_t size);
 static int read_tree(void *data);
 static long read_value(const char *path);
+static int runc(void *data);
 static int run_fuzzer();
 static int run_kvm(const char *devid);
 static int safe_chdir(const char *path);
@@ -82,6 +83,7 @@ static void *safe_malloc(size_t length);
 static long safe_mbind(void *addr, unsigned long length, int mode,
 		       const unsigned long *nodemask, unsigned long maxnode,
 		       unsigned flags);
+static int safe_mkdir(const char* path, mode_t mode);
 static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
 		       off_t offset);
 static int safe_munmap(void *addr, size_t length);
@@ -1035,7 +1037,8 @@ static int build_kernel()
 
 	if (system("rpm -q ncurses-devel") &&
 	    system("dnf -y install openssl-devel bc bison flex patch "
-		   "ncurses-devel elfutils-libelf-devel qemu-kvm genisoimage"))
+		   "ncurses-devel elfutils-libelf-devel qemu-kvm genisoimage "
+		   "runc"))
 			return 1;
 
 	dir = opendir("./linux-next");
@@ -1043,7 +1046,9 @@ static int build_kernel()
 			   "kernel/git/next/linux-next.git"))
 			return 1;
 
-	closedir(dir);
+	if (dir)
+		closedir(dir);
+
 	if (safe_chdir("./linux-next"))
 		return 1;
 
@@ -1510,6 +1515,212 @@ static int safe_unlink(const char *path)
 	return code;
 }
 
+static int runc(void *data)
+{
+	const char *spec_file = "\
+  {\n\
+	\"ociVersion\": \"1.0.0\",\n\
+	\"process\": {\n\
+		\"terminal\": false,\n\
+		\"user\": {\n\
+			\"uid\": 0,\n\
+			\"gid\": 0\n\
+		},\n\
+		\"args\": [\n\
+			\"date\"\n\
+		],\n\
+		\"env\": [\n\
+			\"PATH=/usr/sbin:/usr/bin:/sbin:/bin\",\n\
+			\"TERM=xterm\"\n\
+		],\n\
+		\"cwd\": \"/\",\n\
+		\"capabilities\": {\n\
+			\"bounding\": [\n\
+				\"CAP_AUDIT_WRITE\",\n\
+				\"CAP_KILL\",\n\
+				\"CAP_NET_BIND_SERVICE\"\n\
+			],\n\
+			\"effective\": [\n\
+				\"CAP_AUDIT_WRITE\",\n\
+				\"CAP_KILL\",\n\
+				\"CAP_NET_BIND_SERVICE\"\n\
+			],\n\
+			\"inheritable\": [\n\
+				\"CAP_AUDIT_WRITE\",\n\
+				\"CAP_KILL\",\n\
+				\"CAP_NET_BIND_SERVICE\"\n\
+			],\n\
+			\"permitted\": [\n\
+				\"CAP_AUDIT_WRITE\",\n\
+				\"CAP_KILL\",\n\
+				\"CAP_NET_BIND_SERVICE\"\n\
+			],\n\
+			\"ambient\": [\n\
+				\"CAP_AUDIT_WRITE\",\n\
+				\"CAP_KILL\",\n\
+				\"CAP_NET_BIND_SERVICE\"\n\
+			]\n\
+		},\n\
+		\"rlimits\": [\n\
+			{\n\
+				\"type\": \"RLIMIT_NOFILE\",\n\
+				\"hard\": 1024,\n\
+				\"soft\": 1024\n\
+			}\n\
+		],\n\
+		\"noNewPrivileges\": true\n\
+	},\n\
+	\"root\": {\n\
+		\"path\": \"rootfs\",\n\
+		\"readonly\": true\n\
+	},\n\
+	\"hostname\": \"runc\",\n\
+	\"mounts\": [\n\
+		{\n\
+			\"destination\": \"/proc\",\n\
+			\"type\": \"proc\",\n\
+			\"source\": \"proc\"\n\
+		},\n\
+		{\n\
+			\"destination\": \"/dev\",\n\
+			\"type\": \"tmpfs\",\n\
+			\"source\": \"tmpfs\",\n\
+			\"options\": [\n\
+				\"nosuid\",\n\
+				\"strictatime\",\n\
+				\"mode=755\",\n\
+				\"size=65536k\"\n\
+			]\n\
+		},\n\
+		{\n\
+			\"destination\": \"/dev/pts\",\n\
+			\"type\": \"devpts\",\n\
+			\"source\": \"devpts\",\n\
+			\"options\": [\n\
+				\"nosuid\",\n\
+				\"noexec\",\n\
+				\"newinstance\",\n\
+				\"ptmxmode=0666\",\n\
+				\"mode=0620\"\
+			]\n\
+		},\n\
+		{\n\
+			\"destination\": \"/dev/shm\",\n\
+			\"type\": \"tmpfs\",\n\
+			\"source\": \"shm\",\n\
+			\"options\": [\n\
+				\"nosuid\",\n\
+				\"noexec\",\n\
+				\"nodev\",\n\
+				\"mode=1777\",\n\
+				\"size=65536k\"\n\
+			]\n\
+		},\n\
+		{\n\
+			\"destination\": \"/dev/mqueue\",\n\
+			\"type\": \"mqueue\",\n\
+			\"source\": \"mqueue\",\n\
+			\"options\": [\n\
+				\"nosuid\",\n\
+				\"noexec\",\n\
+				\"nodev\"\n\
+			]\n\
+		},\n\
+		{\n\
+			\"destination\": \"/sys\",\n\
+			\"type\": \"sysfs\",\n\
+			\"source\": \"sysfs\",\n\
+			\"options\": [\n\
+				\"nosuid\",\n\
+				\"noexec\",\n\
+				\"nodev\",\n\
+				\"ro\"\n\
+			]\n\
+		},\n\
+		{\n\
+			\"destination\": \"/sys/fs/cgroup\",\n\
+			\"type\": \"cgroup\",\n\
+			\"source\": \"cgroup\",\n\
+			\"options\": [\n\
+				\"nosuid\",\n\
+				\"noexec\",\n\
+				\"nodev\",\n\
+				\"relatime\",\n\
+				\"ro\"\n\
+			]\n\
+		}\n\
+	],\n\
+	\"linux\": {\n\
+		\"resources\": {\n\
+		},\n\
+		\"namespaces\": [\n\
+			{\n\
+				\"type\": \"pid\"\n\
+			},\n\
+			{\n\
+				\"type\": \"network\"\n\
+			},\n\
+			{\n\
+				\"type\": \"ipc\"\n\
+			},\n\
+			{\n\
+				\"type\": \"uts\"\n\
+			},\n\
+			{\n\
+				\"type\": \"cgroup\"\n\
+			},\n\
+			{\n\
+				\"type\": \"mount\"\n\
+			}\n\
+		],\n\
+		\"maskedPaths\": [\n\
+			\"/proc/kcore\",\n\
+			\"/proc/latency_stats\",\n\
+			\"/proc/timer_list\",\n\
+			\"/proc/timer_stats\",\n\
+			\"/proc/sched_debug\",\n\
+			\"/sys/firmware\"\n\
+		],\n\
+		\"readonlyPaths\": [\n\
+			\"/proc/asound\",\n\
+			\"/proc/bus\",\n\
+			\"/proc/fs\",\n\
+			\"/proc/irq\",\n\
+			\"/proc/sys\",\n\
+			\"/proc/sysrq-trigger\"\n\
+		]\n\
+	}\n\
+}\n";
+	DIR *dir = opendir("./rootfs");
+
+	print_start(__func__);
+	if (!dir && safe_mkdir("./rootfs", 0755))
+		return 1;
+
+	if (dir)
+		closedir(dir);
+
+	if (write_file("./config.json", (char *)spec_file,
+		       strlen(spec_file)))
+		return 1;
+
+	/* Do not care about errors. */
+	system("runc run root");
+	printf("- pass: %s\n", __func__);
+
+	return 0;
+}
+
+int safe_mkdir(const char *path, mode_t mode)
+{
+	int code = mkdir(path, mode);
+
+	if (code)
+		perror("mkdir");
+
+	return code;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -1555,6 +1766,8 @@ int main(int argc, char *argv[])
 	i++;
 	bugs[i] = new(i, mmap_hugetlbfs, (void *)64,
 		"mmap a file in hugetlbfs.");
+	i++;
+	bugs[i] = new(i, runc, NULL, "spawn a runc container.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhfk::lx:")) != -1) {
