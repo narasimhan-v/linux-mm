@@ -23,23 +23,34 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 
 #define MADV_SOFT_OFFLINE 101
-#define MPOL_BIND 2
 #define MPOL_MF_MOVE_ALL (1 << 2)
 #define NR_BUG 5000
 #define NR_LOOP 1000
 #define NR_NODE 4096
 #define NR_PAGE 20
 #define NR_THREAD 10
-
+enum {
+	MPOL_DEFAULT,
+	MPOL_PREFERRED,
+	MPOL_BIND,
+	MPOL_INTERLEAVE,
+	MPOL_LOCAL,
+	MPOL_MAX,	/* always last member of enum */
+};
 struct bug {
 	int number;
 	int (* func)(void *data);
 	void *data;
 	char *string;
 };
-
+struct mmap_huge {
+	char *addr;
+	size_t size;
+	size_t hpage_size;
+};
 static int alloc_mmap(size_t length);
 static int alloc_mmap_hotplug_memory(void *data);
 static struct bug *new(int number, int (* func)(void *data), void *data,
@@ -56,6 +67,7 @@ static int hotplug_cpu(void *data);
 static int hotplug_memory();
 static void list_bug(struct bug *bugs[]);
 static void loop_mmap(size_t length);
+static int loop_mmap_huge(void *data);
 static int loop_move_pages(int node1, int node2, size_t length);
 static int migrate_huge_hotplug_memory(void *data);
 static int migrate_huge_offline(size_t free_size);
@@ -93,11 +105,15 @@ static long safe_migrate_pages(int pid, unsigned long max_node,
 			       const unsigned long *new_nodes);
 static DIR *safe_opendir(const char *path);
 static int safe_open(const char *path, int flags);
+static int safe_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+			       void *(*start_routine)(void *), void *arg);
+static int safe_pthread_join(pthread_t thread, void **retval);
 static int safe_unlink(const char *path);
 static int safe_waitpid(pid_t pid, int *status, int options);
 static int scan_ksm();
 static long set_node_huge(int node, long size, size_t huge_size);
 static void *thread_mmap(void *data);
+static void *thread_write(void *data);
 static void usage(const char *name);
 static int write_file(const char *path, char *buf, size_t size);
 static int write_value(const char *path, long value);
@@ -806,10 +822,10 @@ static int migrate_ksm(void *data)
 		if (safe_migrate_pages(0, NR_NODE, mask1, mask2) < 0)
 			goto out;
 	}
-	for (i = 0; i < NR_PAGE; i++)
+	for (i = 0; i < NR_PAGE; i++) {
 		if (safe_munmap(pages[i], pagesz))
 			return 1;
-
+	}
 	if (run == 1)
 		goto pass;
 
@@ -1171,11 +1187,17 @@ static int oom(void *data)
 
 		mask[0] = 1 << node2;
 		if (syscall(__NR_set_mempolicy, MPOL_BIND, mask, NR_NODE)) {
-			perror("set_mempolicy");
+			perror("set_mempolicy MPOL_BIND");
 			return 1;
 		}
 	}
 	alloc_mmap(0);
+	if (data) {
+		if (syscall(__NR_set_mempolicy, MPOL_DEFAULT, NULL, NR_NODE)) {
+			perror("set_mempolicy MPOL_DEFAULT");
+			return 1;
+		}
+	}
 	printf("- pass: %s\n", string);
 
 	return 0;
@@ -1451,6 +1473,7 @@ out:
 static int mmap_hugetlbfs(void *data)
 {
 	int fd;
+	int code = 1;
 	char *mount = "/dev/hugepages";
 	char *nr_huge = "/proc/sys/vm/nr_hugepages";
 	char name[100];
@@ -1466,35 +1489,41 @@ static int mmap_hugetlbfs(void *data)
 
 	save = read_value(nr_huge);
 	if (save < 0 || write_value(nr_huge, (long)data))
-		return 1;
+		goto out_close;
 
 	huge_size = get_meminfo("Hugepagesize:");
 	if (huge_size < 0)
-		return 1;
+		goto out_save;
 
 	huge_size *= 1024;
 	addr = safe_mmap(NULL, huge_size, PROT_READ | PROT_WRITE, MAP_SHARED,
 			 fd, 0);
 	if (addr == MAP_FAILED)
-		return 1;
+		goto out_save;
 
 	/* Force to allocate page and change HugePages_Free. */
 	*(int *)addr = 0;
 	curr = get_meminfo("HugePages_Free:");
 	if (curr != (long)data - 1) {
 		fprintf(stderr, "- error nr_hugepages is %ld.\n", curr);
-		return 1;
+		goto out;
 	}
-
-	if (safe_munmap(addr, huge_size) || write_value(nr_huge, save))
+	code = 0;
+out:
+	if (safe_munmap(addr, huge_size))
 		return 1;
-
+out_save:
+	if (write_value(nr_huge, save))
+		return 1;
+out_close:
 	close(fd);
 	if (safe_unlink(name))
 		return 1;
 
-	printf("- pass: %s\n", __func__);
-	return 0;
+	if (!code)
+		printf("- pass: %s\n", __func__);
+
+	return code;
 }
 
 static int write_value(const char *path, long value)
@@ -1738,6 +1767,121 @@ int safe_mkdir(const char *path, mode_t mode)
 	return code;
 }
 
+static int loop_mmap_huge(void *data)
+{
+	char *nr_huge = "/proc/sys/vm/nr_hugepages";
+	size_t hpage_size;
+	size_t loop = (size_t)data;
+	size_t size = loop + 1;
+	long save;
+	void *addr;
+	int i;
+	int code = 1;
+	struct mmap_huge *mmap_size;
+	pthread_t *thread;
+
+	print_start(__func__);
+	mmap_size = safe_malloc(sizeof(struct mmap_huge) * loop);
+	if (!mmap_size)
+		return 1;
+
+	save = read_value(nr_huge);
+	if (save < 0 || write_value(nr_huge, size))
+		goto out_mmap;
+
+	hpage_size = get_meminfo("Hugepagesize:");
+	if (hpage_size < 0)
+		goto out_save;
+
+	hpage_size *= 1024;
+	addr = safe_mmap(NULL, size * hpage_size, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+	if (addr == MAP_FAILED)
+		goto out_save;
+
+	thread = safe_malloc(sizeof(pthread_t) * loop);
+	if (!thread)
+		goto out_munmap;
+
+	for (i = 0; i < loop; i++, size--) {
+		void *new_addr;
+
+		mmap_size[i].size = size;
+		mmap_size[i].addr = addr;
+		mmap_size[i].hpage_size = hpage_size;
+		if (safe_pthread_create(&thread[i], NULL, thread_write,
+					&mmap_size[i]))
+			goto out;
+
+		new_addr = safe_mmap(addr, (size - 1) * hpage_size,
+				     PROT_READ | PROT_WRITE,
+				     MAP_PRIVATE | MAP_ANONYMOUS |
+				     MAP_HUGETLB | MAP_FIXED, -1, 0);
+		if (new_addr == MAP_FAILED)
+			goto out;
+
+		addr = new_addr;
+	}
+	for (i = 0; i < loop; i++) {
+		if (safe_pthread_join(thread[i], NULL))
+			goto out;
+	}
+	code = 0;
+out:
+	free(thread);
+out_munmap:
+	if (safe_munmap(addr, size * hpage_size))
+		return 1;
+out_save:
+	if (write_value(nr_huge, save))
+		return 1;
+out_mmap:
+	free(mmap_size);
+	if (!code)
+		printf("- pass: %s\n", __func__);
+
+	return code;
+}
+
+static int safe_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+			       void *(*start_routine)(void *), void *arg)
+{
+	int code = pthread_create(thread, attr, start_routine, arg);
+
+	if (code)
+		perror("pthread_create");
+
+	return code;
+}
+
+static int safe_pthread_join(pthread_t thread, void **retval)
+{
+	int code = pthread_join(thread, retval);
+
+	if (code)
+		perror("pthread_join");
+
+	return code;
+}
+
+static void *thread_write(void *data)
+{
+	struct mmap_huge *mmap_size = data;
+	int i, j, loop, size, pages;
+
+	srand(time(NULL));
+	loop = rand() % 10;
+	for (i = 0; i < loop; i++) {
+		size = rand() % mmap_size->size;
+		for (j = 0; j <= size; j++) {
+			pages = rand() % mmap_size->size;
+			*(mmap_size->addr + pages * mmap_size->hpage_size) =
+				rand();
+		}
+	}
+	return NULL;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -1774,7 +1918,7 @@ int main(int argc, char *argv[])
 	i++;
 	bugs[i] = new(i, oom, NULL, "trigger normal OOM.");
 	i++;
-	bugs[i] = new(i, oom, "", "trigger NUMA OOM.");
+	bugs[i] = new(i, oom, "NUMA", "trigger NUMA OOM.");
 	i++;
 	bugs[i] = new(i, read_tree, "/proc", "read all procfs files.");
 	i++;
@@ -1785,6 +1929,9 @@ int main(int argc, char *argv[])
 		"mmap a file in hugetlbfs.");
 	i++;
 	bugs[i] = new(i, runc, NULL, "spawn a runc container.");
+	i++;
+	bugs[i] = new(i, loop_mmap_huge, (void *)63,
+		"mmap hugepages concurrently.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhfk::lx:")) != -1) {
