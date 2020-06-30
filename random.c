@@ -79,6 +79,7 @@ static int cap_cpu();
 static int cat(const char *from, FILE *fp_to);
 static int copy(const char *from, const char *to);
 static void delete(struct bug *bug);
+static void end_string(char *string, size_t size, char end);
 static int fill_semget(void *data);
 static size_t get_meminfo(const char *field);
 static int get_numa(int *node1, int *node2);
@@ -1306,12 +1307,15 @@ static int run_kvm(const char *devid)
 		if (read_file(name, vendor, sizeof(vendor)))
 			return 1;
 
+		end_string(vendor, sizeof(vendor), '\n');
 		snprintf(name, sizeof(name), "%s/device", sysfs);
 		if (read_file(name, device, sizeof(device)))
 			return 1;
 
+		end_string(device, sizeof(device), '\n');
 		/* Have to remove the leading "0x" first. */
 		snprintf(buf, sizeof(buf), "%s %s", vendor + 2, device + 2);
+
 		snprintf(name, sizeof(name), "%s/new_id", vfio);
 		/* Write to the "new_id" will flip the driver to vfio-pci. */
 		if (write_file(name, buf, strlen(buf)))
@@ -1948,6 +1952,16 @@ static int memfd_huge(void *data)
 	}
 	printf("- pass: %s\n", __func__);
 	return 0;
+}
+
+static void end_string(char *string, size_t size, char end)
+{
+	int i;
+
+	for (i = 0; i < size; i++) {
+		if (string[i] == end)
+			string[i] = 0;
+	}
 }
 
 int main(int argc, char *argv[])
