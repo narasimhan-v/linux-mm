@@ -2,6 +2,7 @@
 /*
  * random kernel bug collection
  */
+#define _GNU_SOURCE
 #include <assert.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -25,7 +26,20 @@
 #include <sys/wait.h>
 #include <time.h>
 
+#define HUGETLB_FLAG_ENCODE_SHIFT 26
 #define MADV_SOFT_OFFLINE 101
+#define MFD_HUGE_64KB (16 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_512KB (19 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_1MB (20 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_2MB (21 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_8MB (23 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_16MB (24 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_32MB (25 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_256MB (28 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_512MB (29 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_1GB (30 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_2GB (31 << HUGETLB_FLAG_ENCODE_SHIFT)
+#define MFD_HUGE_16GB (34 << HUGETLB_FLAG_ENCODE_SHIFT)
 #define MPOL_MF_MOVE_ALL (1 << 2)
 #define NR_BUG 5000
 #define NR_LOOP 1000
@@ -51,6 +65,11 @@ struct mmap_huge {
 	size_t size;
 	size_t hpage_size;
 };
+struct memfd {
+	int flag;
+	int error;
+	char *string;
+};
 static int alloc_mmap(size_t length);
 static int alloc_mmap_hotplug_memory(void *data);
 static struct bug *new(int number, int (* func)(void *data), void *data,
@@ -69,6 +88,7 @@ static void list_bug(struct bug *bugs[]);
 static void loop_mmap(size_t length);
 static int loop_mmap_huge(void *data);
 static int loop_move_pages(int node1, int node2, size_t length);
+static int memfd_huge(void *data);
 static int migrate_huge_hotplug_memory(void *data);
 static int migrate_huge_offline(size_t free_size);
 static int migrate_ksm(void *data);
@@ -1882,6 +1902,54 @@ static void *thread_write(void *data)
 	return NULL;
 }
 
+static int memfd_huge(void *data)
+{
+	struct memfd memfd_list[] = {
+		{.flag = MFD_HUGE_64KB, .string = "64kB"},
+		{.flag = MFD_HUGE_512KB, .string = "512kB"},
+		{.flag = MFD_HUGE_1MB, .string = "1024kB"},
+		{.flag = MFD_HUGE_2MB, .string = "2048kB"},
+		{.flag = MFD_HUGE_8MB, .string = "8192kB"},
+		{.flag = MFD_HUGE_16MB, .string = "16384kB"},
+		{.flag = MFD_HUGE_32MB, .string = "32768kB"},
+		{.flag = MFD_HUGE_256MB, .string = "262144kB"},
+		{.flag = MFD_HUGE_512MB, .string = "524288kB"},
+		{.flag = MFD_HUGE_1GB, .string = "1048576kB"},
+		{.flag = MFD_HUGE_2GB, .string = "2097152kB"},
+		{.flag = MFD_HUGE_16GB, .string = "16777216kB"}
+	};
+	int loop = sizeof(memfd_list) / sizeof(struct memfd);
+	int i;
+	char *sysfs = "/sys/kernel/mm/hugepages";
+	char name[100];
+
+	print_start(__func__);
+	for (i = 0; i < loop; i++) {
+		snprintf(name, sizeof(name), "%s/hugepages-%s", sysfs,
+			 memfd_list[i].string);
+		if (access(name, F_OK))
+			memfd_list[i].error = ENODEV;
+		else
+			memfd_list[i].error = 0;
+	}
+	for (i = 0; i < loop; i++) {
+		int fd;
+
+		fd = memfd_create("memfd", MFD_HUGETLB | memfd_list[i].flag);
+		if (fd < 0) {
+			if (errno != memfd_list[i].error) {
+				perror("memfd_create");
+				return 1;
+			}
+		} else {
+			printf("- created memfd for %s.\n",
+			       memfd_list[i].string);
+		}
+	}
+	printf("- pass: %s\n", __func__);
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -1932,6 +2000,8 @@ int main(int argc, char *argv[])
 	i++;
 	bugs[i] = new(i, loop_mmap_huge, (void *)63,
 		"mmap hugepages concurrently.");
+	i++;
+	bugs[i] = new(i, memfd_huge, NULL, "create memfd in hugetlbfs.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhfk::lx:")) != -1) {
@@ -1987,7 +2057,7 @@ int main(int argc, char *argv[])
 
 		code += bugs[j]->func(bugs[j]->data);
 	}
-	if (kvm)
+	if (kvm && !code)
 		code += run_kvm(devid);
 
 	if (fuzzer && !code)
