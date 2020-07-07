@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/loop.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -16,10 +17,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/sem.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
@@ -78,9 +82,14 @@ static int build_kernel();
 static int cap_cpu();
 static int cat(const char *from, FILE *fp_to);
 static int copy(const char *from, const char *to);
+static int create_loopback(unsigned long megabyte);
+static int create_xfs(const char *dev, const char *mount);
 static void delete(struct bug *bug);
+static int delete_loopback(unsigned loopback);
 static void end_string(char *string, size_t size, char end);
 static int fill_semget(void *data);
+static int fill_xfs(void *data);
+static int force_mkdir(const char *path);
 static size_t get_meminfo(const char *field);
 static int get_numa(int *node1, int *node2);
 static int hotplug_cpu(void *data);
@@ -107,10 +116,13 @@ static int runc(void *data);
 static int run_fuzzer();
 static int run_kvm(const char *devid);
 static int safe_chdir(const char *path);
+static int safe_close(int fd);
+static int safe_fclose(FILE *fp);
 static FILE *safe_fdopen(int fd, const char *mode);
-static pid_t safe_fork();
 static int safe_ferror(FILE *fp, const char *reason);
+static pid_t safe_fork();
 static FILE *safe_fopen(const char *path, const char *mode);
+static int safe_fsync(int fd);
 static int safe_lstat(const char *path, struct stat *stat);
 static void *safe_malloc(size_t length);
 static long safe_mbind(void *addr, unsigned long length, int mode,
@@ -119,6 +131,9 @@ static long safe_mbind(void *addr, unsigned long length, int mode,
 static int safe_mkdir(const char* path, mode_t mode);
 static void *safe_mmap(void *addr, size_t length, int prot, int flags, int fd,
 		       off_t offset);
+static int safe_mount(const char *source, const char *target,
+		      const char *fstype, unsigned long flags,
+		      const void *data);
 static int safe_munmap(void *addr, size_t length);
 static int safe_mlock(const void *addr, size_t length);
 static long safe_migrate_pages(int pid, unsigned long max_node,
@@ -129,10 +144,13 @@ static int safe_open(const char *path, int flags);
 static int safe_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 			       void *(*start_routine)(void *), void *arg);
 static int safe_pthread_join(pthread_t thread, void **retval);
+static int safe_statvfs(const char *path, struct statvfs *buf);
+static int safe_umount(const char *target);
 static int safe_unlink(const char *path);
 static int safe_waitpid(pid_t pid, int *status, int options);
 static int scan_ksm();
 static long set_node_huge(int node, long size, size_t huge_size);
+static void *thread_fill(void *data);
 static void *thread_mmap(void *data);
 static void *thread_write(void *data);
 static void usage(const char *name);
@@ -314,7 +332,8 @@ static size_t get_meminfo(const char *field)
 	fprintf(stderr, "- error getting %s in meminfo.\n", field);
 out:
 	free(line);
-	fclose(fp);
+	if (safe_fclose(fp))
+		return -1;
 
 	return value;
 }
@@ -348,7 +367,9 @@ static long set_node_huge(int node, long size, size_t huge_size)
 	if (safe_ferror(fp, "write nr_hugepages"))
 		return -1;
 out:
-	fclose(fp);
+	if (safe_fclose(fp))
+		return -1;
+
 	return save;
 }
 
@@ -465,7 +486,8 @@ static int get_numa(int *node1, int *node2)
 	getline(&line, &length, fp);
 	sscanf(line, "%d%*c%d", node1, node2);
 	free(line);
-	fclose(fp);
+	if (safe_fclose(fp))
+		return 1;
 
 	if (*node1 == -1 || *node2 == -1) {
 		fprintf(stderr, "- error requiring 2 NUMA nodes.\n");
@@ -492,8 +514,8 @@ static int read_file(const char *path, char *buf, size_t size)
 		close(fd);
 		return 1;
 	}
-	fclose(fp);
-	close(fd);
+	if (safe_fclose(fp))
+		return 1;
 
 	return 0;
 }
@@ -518,10 +540,9 @@ static int write_file(const char *path, char *buf, size_t size)
 	assert(buf);
 	fwrite(buf, size, 1, fp);
 	fflush(fp);
-	if (safe_ferror(fp, __func__))
+	if (safe_ferror(fp, __func__) || safe_fclose(fp))
 		return 1;
 
-	fclose(fp);
 	return 0;
 }
 
@@ -551,7 +572,9 @@ static int scan_ksm()
 		if (safe_ferror(fp, "write ksm"))
 			return -1;
 	}
-	fclose(fp);
+	if (safe_fclose(fp))
+		return -1;
+
 	snprintf(path, sizeof(path), "%s/full_scans", base);
 	scans = read_value(path);
 	if (scans < 0)
@@ -715,10 +738,8 @@ static int hotplug_memory()
 
 		fwrite("1", 2, 1, fp);
 		fflush(fp);
-		if (safe_ferror(fp, "online"))
+		if (safe_ferror(fp, "online") || safe_fclose(fp))
 			goto out;
-
-		fclose(fp);
 	}
 	closedir(dir);
 	printf("- pass: %s\n", __func__);
@@ -982,7 +1003,9 @@ static int cat(const char *from, FILE *fp_to)
 	while ((c = getc(fp)) != EOF)
 		putc(c, fp_to);
 
-	fclose(fp);
+	if (safe_fclose(fp))
+		return 1;
+
 	return 0;
 }
 
@@ -990,10 +1013,9 @@ static int copy(const char *from, const char *to)
 {
 	FILE *fp = safe_fopen(to, "w");
 
-	if (!fp || cat(from, fp))
+	if (!fp || cat(from, fp) || safe_fclose(fp))
 		return 1;
 
-	fclose(fp);
 	return 0;
 }
 
@@ -1045,10 +1067,8 @@ static int hotplug_cpu(void *data)
 
 		fwrite("1", 2, 1, fp);
 		fflush(fp);
-		if (safe_ferror(fp, "online"))
+		if (safe_ferror(fp, "online") || safe_fclose(fp))
 			goto out;
-
-		fclose(fp);
 	}
 	closedir(dir);
 	if (!data)
@@ -1540,8 +1560,7 @@ out_save:
 	if (write_value(nr_huge, save))
 		return 1;
 out_close:
-	close(fd);
-	if (safe_unlink(name))
+	if (safe_close(fd) || safe_unlink(name))
 		return 1;
 
 	if (!code)
@@ -1761,16 +1780,10 @@ int main()\n\
 	printf(\"Hello, World!\\n\");\n\
 	return 0;\n\
 }\n";
-	DIR *dir = opendir("./rootfs");
 
 	print_start(__func__);
-	if (!dir && safe_mkdir("./rootfs", 0755))
-		return 1;
-
-	if (dir)
-		closedir(dir);
-
-	if (write_file("./config.json", (char *)spec_file,
+	if (force_mkdir("./rootfs") ||
+	    write_file("./config.json", (char *)spec_file,
 		       strlen(spec_file)) ||
 	    write_file("./hello.c", (char *)hello, strlen(hello)) ||
 	    system("gcc -static -o hello hello.c") || system("runc run root"))
@@ -1964,6 +1977,309 @@ static void end_string(char *string, size_t size, char end)
 	}
 }
 
+static int create_loopback(unsigned long megabyte)
+{
+	size_t size = megabyte * 1024 * 1024;
+	char *buf = safe_malloc(size);
+	char loopname[100];
+	int fd, back_fd;
+	int loopback = -1;
+
+	if (!buf)
+		return -1;
+
+	memset(buf, 0, size);
+	if (write_file("./file.img", buf, size))
+		goto out_free;
+
+	fd = safe_open("/dev/loop-control", O_RDWR);
+	if (fd < 0)
+		goto out_free;
+
+	loopback = ioctl(fd, LOOP_CTL_GET_FREE);
+	if (loopback < 0) {
+		perror("ioctl LOOP_CTL_GET_FREE");
+		goto out;
+	}
+	if (safe_close(fd))
+		goto out_free;
+
+	snprintf(loopname, sizeof(loopname), "/dev/loop%d", loopback);
+	printf("- loopname is %s.\n", loopname);
+	fd = safe_open(loopname, O_RDWR);
+	if (fd < 0)
+		goto out_free;
+
+	back_fd = safe_open("./file.img", O_RDWR);
+	if (back_fd < 0) {
+		loopback = -1;
+		goto out;
+	}
+	if (ioctl(fd, LOOP_SET_FD, back_fd) < 0) {
+		perror("ioctl LOOP_SET_FD");
+		loopback = -1;
+	}
+	if (safe_close(back_fd))
+		loopback = -1;
+out:
+	if (safe_close(fd))
+		loopback = -1;
+out_free:
+	free(buf);
+	return loopback;
+}
+
+static int safe_mount(const char *source, const char *target,
+		      const char *fstype, unsigned long flags,
+		      const void *data)
+{
+	int code = mount(source, target, fstype, flags, data);
+
+	if (code)
+		perror("mount");
+
+	return code;
+}
+
+static int force_mkdir(const char *path)
+{
+	DIR *dir;
+
+	dir = opendir(path);
+	if (!dir && safe_mkdir(path, 0755))
+		return 1;
+
+	if (dir)
+		closedir(dir);
+
+	return 0;
+}
+
+static int create_xfs(const char *dev, const char *mount)
+{
+	char cmd[100];
+
+	snprintf(cmd, sizeof(cmd), "mkfs.xfs %s", dev);
+	if (system(cmd) || force_mkdir(mount) ||
+	    safe_mount(dev, mount, "xfs", 0, NULL))
+		return 1;
+
+	return 0;
+}
+
+static int safe_umount(const char *target)
+{
+	int code = umount(target);
+
+	if (code)
+		perror("umount");
+
+	return code;
+}
+
+static int safe_statvfs(const char *path, struct statvfs *buf)
+{
+	int code = statvfs(path, buf);
+
+	if (code)
+		perror("statvfs");
+
+	return code;
+}
+
+static int safe_fsync(int fd)
+{
+	int code = fsync(fd);
+
+	if (code)
+		perror("fsync");
+
+	return code;
+}
+
+static void *thread_fill(void *data)
+{
+	char file[PATH_MAX];
+	char buf[4096];
+	char *path = data;
+	int i, ret, fd;
+	long code = 1;
+	size_t length;
+	size_t tmp;
+	struct statvfs vfs;
+	DIR *dir;
+	struct dirent *entry;
+
+	if (safe_statvfs(path, &vfs))
+		return (void *)1;
+
+	for (i = 0; ; i++) {
+		snprintf(file, sizeof(file), "%s/file%d", path, i);
+		fd = safe_open(file, O_WRONLY | O_CREAT);
+		if (fd < 0) {
+			if (errno == ENOSPC)
+				code = 0;
+
+			goto out;
+		}
+		length = random() % (100 * 1024 * 1024);
+		while (length) {
+			tmp = (sizeof(buf) > length) ? length : sizeof(buf);
+			ret = write(fd, buf, tmp);
+			if (ret < 0) {
+				if (safe_fsync(fd))
+					goto out;
+				/*
+				 * Retry on ENOSPC to make sure filesystem is
+				 * really full.
+				 */
+				if (errno == ENOSPC &&
+				    length >= vfs.f_bsize / 2) {
+					length /= 2;
+					continue;
+				}
+				if (!safe_close(fd))
+					code = 0;
+
+				goto out;
+			}
+			length -= ret;
+		}
+		if (safe_close(fd))
+			goto out;
+	}
+out:
+	dir = safe_opendir(path);
+	if (!dir)
+		return (void *)1;
+
+	while ((entry = readdir(dir))) {
+		if (!strcmp(entry->d_name, ".") ||
+		    !strcmp(entry->d_name, ".."))
+			continue;
+
+		snprintf(file, sizeof(file), "%s/%s", path, entry->d_name);
+		if (safe_unlink(file)) {
+			closedir(dir);
+			return (void *)1;
+		}
+	}
+	closedir(dir);
+	return (void *)code;
+}
+
+static int safe_close(int fd)
+{
+	int code = close(fd);
+
+	if (code)
+		perror("close");
+
+	return code;
+}
+
+static int safe_fclose(FILE *fp)
+{
+	int code = fclose(fp);
+
+	if (code)
+		perror("fclose");
+
+	return code;
+}
+
+static int fill_xfs(void *data)
+{
+	int loopback, i, j;
+	int code = 1;
+	long ret;
+	size_t length = 100;
+	const char *mnt = "./mnt";
+	char loopname[100];
+	char **path;
+	pthread_t *thread;
+	int cpu;
+
+	print_start(__func__);
+	loopback = create_loopback((unsigned long)data);
+	if (loopback < 0)
+		return 1;
+
+	snprintf(loopname, sizeof(loopname), "/dev/loop%d", loopback);
+	if (create_xfs(loopname, mnt))
+		return 1;
+
+	cpu = cap_cpu();
+	if (cpu < 1)
+		return 1;
+
+	thread = safe_malloc(sizeof(pthread_t) * cpu);
+	if (!thread)
+		return 1;
+
+	path = safe_malloc(sizeof(char *) * cpu);
+	if (!path)
+		goto out;
+
+	/* Need to setup first before triggering ENOSPC. */
+	for (i = 0; i < cpu; i++) {
+		path[i] = safe_malloc(length);
+		if (!path[i])
+			goto out_free;
+
+		snprintf(path[i], length, "%s/%d", mnt, i);
+		if (force_mkdir(path[i])) {
+			/* Need to free this one. */
+			i++;
+			goto out_free;
+		}
+	}
+	for (j = 0; j < cpu; j++) {
+		if (safe_pthread_create(&thread[j], NULL, thread_fill,
+					path[j])) {
+			goto out_free;
+		}
+	}
+	for (j = 0; j < cpu; j++) {
+		if (safe_pthread_join(thread[j], (void **)&ret) || ret)
+			goto out_free;
+	}
+	if (safe_umount(mnt) || delete_loopback(loopback))
+		goto out_free;
+
+	printf("- pass: %s\n", __func__);
+	code = 0;
+out_free:
+	for (j = 0; j < i; j++)
+		free(path[j]);
+
+	free(path);
+out:
+	free(thread);
+	return code;
+}
+
+static int delete_loopback(unsigned loopback)
+{
+	char loopname[100];
+	int fd;
+
+	snprintf(loopname, sizeof(loopname), "/dev/loop%d", loopback);
+	fd = safe_open(loopname, O_RDWR);
+	if (fd < 0)
+		return 1;
+
+	if (ioctl(fd, LOOP_CLR_FD, 0) < 0) {
+		perror("ioctl LOOP_CLR_FD");
+		close(fd);
+		return 1;
+	}
+	if (safe_close(fd) || safe_unlink("./file.img"))
+		return 1;
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -2016,6 +2332,8 @@ int main(int argc, char *argv[])
 		"mmap hugepages concurrently.");
 	i++;
 	bugs[i] = new(i, memfd_huge, NULL, "create memfd in hugetlbfs.");
+	i++;
+	bugs[i] = new(i, fill_xfs, (void *)512, "fill up XFS repetitively.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhfk::lx:")) != -1) {
