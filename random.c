@@ -74,6 +74,13 @@ struct memfd {
 	int error;
 	char *string;
 };
+struct file_args {
+	int fd_read;
+	int fd_write;
+	int pagesize;
+	void *ptr;
+};
+static bool done;
 static int alloc_mmap(size_t length);
 static int alloc_mmap_hotplug_memory(void *data);
 static struct bug *new(int number, int (* func)(void *data), void *data,
@@ -81,6 +88,7 @@ static struct bug *new(int number, int (* func)(void *data), void *data,
 static int build_kernel();
 static int cap_cpu();
 static int cat(const char *from, FILE *fp_to);
+static void *collapse_range(void *data);
 static int copy(const char *from, const char *to);
 static int create_loopback(unsigned long megabyte);
 static int create_xfs(const char *dev, const char *mount);
@@ -103,26 +111,31 @@ static int migrate_huge_hotplug_memory(void *data);
 static int migrate_huge_offline(size_t free_size);
 static int migrate_ksm(void *data);
 static int mmap_bind_node_huge(int node, size_t length);
+static int mmap_collision();
 static int mmap_hugetlbfs(void *data);
 static int mmap_offline_node_huge(size_t length);
 static int oom(void *data);
 static void print_start(const char *name);
+static void *punch_hole(void *data);
 static int range(char *string, bool *array, int size, bool value);
 static int read_all(const char *path);
 static int read_file(const char *path, char *buf, size_t size);
 static int read_tree(void *data);
 static long read_value(const char *path);
 static int runc(void *data);
+static int run_fileops(void *(*fileops)(void *), struct file_args file);
 static int run_fuzzer();
 static int run_kvm(const char *devid);
 static int safe_chdir(const char *path);
 static int safe_close(int fd);
 static int safe_fclose(FILE *fp);
+static int safe_fallocate(int fd, int mode, off_t offset, off_t len);
 static FILE *safe_fdopen(int fd, const char *mode);
 static int safe_ferror(FILE *fp, const char *reason);
 static pid_t safe_fork();
 static FILE *safe_fopen(const char *path, const char *mode);
 static int safe_fsync(int fd);
+static int safe_ftruncate(int fd, off_t length);
 static int safe_lstat(const char *path, struct stat *stat);
 static void *safe_malloc(size_t length);
 static long safe_mbind(void *addr, unsigned long length, int mode,
@@ -153,9 +166,12 @@ static long set_node_huge(int node, long size, size_t huge_size);
 static void *thread_fill(void *data);
 static void *thread_mmap(void *data);
 static void *thread_write(void *data);
+static void *truncate_down(void *data);
 static void usage(const char *name);
 static int write_file(const char *path, char *buf, size_t size);
 static int write_value(const char *path, long value);
+static int debug_xfs(unsigned long bsize, char *ops);
+static void *zero_range(void *data);
 
 static void print_start(const char *name)
 {
@@ -2280,6 +2296,244 @@ static int delete_loopback(unsigned loopback)
 	return 0;
 }
 
+static int debug_xfs(unsigned long bsize, char *ops)
+{
+	char cmd[100];
+
+	snprintf(cmd, sizeof(cmd),
+		"xfs_io -F -f -c 'pwrite 0 %lu' -c sync "
+		"-c '%s %lu %lu' xfs_io",
+		bsize * 5, ops, bsize, bsize * 2);
+	if (system(cmd))
+		return 1;
+
+	return 0;
+}
+
+static int run_fileops(void *(*fileops)(void *), struct file_args file)
+{
+	const int thread = 2;
+	int i;
+	pthread_t worker_thread[thread];
+	long ret;
+
+	done = 0;
+	for (i = 0; i < thread; i++)
+		if (safe_pthread_create(&worker_thread[i], NULL,
+					fileops, (void *)&file))
+			return 1;
+
+	sleep(1);
+	done = 1;
+	for (i = 0; i < thread; i++)
+		if (safe_pthread_join(worker_thread[i], (void **)&ret) || ret)
+			return 1;
+
+	return 0;
+}
+
+static void *punch_hole(void *data)
+{
+	ssize_t read;
+	struct file_args file = *(struct file_args *)data;
+	int rc;
+	int fsize = file.pagesize * 4;
+
+	while (!done) {
+		read = 0;
+		do {
+			rc = pread(file.fd_read, file.ptr + read, fsize - read,
+				   read);
+			if (rc > 0)
+				read += rc;
+		} while (rc > 0);
+
+		if (read != fsize || rc) {
+			fprintf(stderr, "%s pread: %s\n", __func__,
+				strerror(errno));
+			return (void *)1;
+		}
+		rc = safe_fallocate(file.fd_write,
+				    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+				    0, fsize);
+		if (rc < 0)
+			return (void *)1;
+
+		usleep(rand() % 1000);
+	}
+	return NULL;
+}
+
+static void *zero_range(void *data)
+{
+	ssize_t read;
+	struct file_args file = *(struct file_args *)data;
+	int rc;
+	int fsize = file.pagesize * 4;
+
+	while (!done) {
+		read = 0;
+		do {
+			rc = pread(file.fd_read, file.ptr + read, fsize - read,
+				   read);
+			if (rc > 0)
+				read += rc;
+		} while (rc > 0);
+
+		if (read != fsize || rc != 0) {
+			fprintf(stderr, "%s pread: %s\n", __func__,
+				strerror(errno));
+			return (void *)1;
+		}
+		rc = safe_fallocate(file.fd_write,
+				FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE,
+				0, fsize);
+		if (rc < 0)
+			return (void *)1;
+
+		usleep(rand() % 1000);
+	}
+	return NULL;
+}
+
+static void *truncate_down(void *data)
+{
+	ssize_t read;
+	struct file_args file = *(struct file_args *)data;
+	int rc;
+	int fsize = file.pagesize * 4;
+
+	while (!done) {
+		read = 0;
+
+		if (safe_ftruncate(file.fd_write, 0) ||
+		    safe_fallocate(file.fd_write, 0, 0, fsize))
+			return (void *)1;
+
+		do {
+			rc = pread(file.fd_read, file.ptr + read, fsize - read,
+				   read);
+			if (rc > 0)
+				read += rc;
+		} while (rc > 0);
+		/*
+		 * Ignore errors from pread(). These errors can happen if the
+		 * other thread has made the file size 0.
+		 */
+		usleep(rand() % 1000);
+	}
+	return NULL;
+}
+
+static void *collapse_range(void *data)
+{
+	ssize_t read;
+	struct file_args file = *(struct file_args *)data;
+	int rc;
+	int fsize = file.pagesize * 4;
+
+	while (!done) {
+		read = 0;
+
+		if (safe_fallocate(file.fd_write, 0, 0, fsize) ||
+		    safe_fallocate(file.fd_write, FALLOC_FL_COLLAPSE_RANGE, 0,
+				   file.pagesize) ||
+		    safe_fallocate(file.fd_write, 0, 0, fsize))
+			return (void *)1;
+
+		do {
+			rc = pread(file.fd_read, file.ptr + read, fsize - read,
+				   read);
+			if (rc > 0)
+				read += rc;
+		} while (rc > 0);
+
+		/* Ignore errors from pread(). */
+		usleep(rand() % 1000);
+	}
+	return NULL;
+}
+
+static int safe_fallocate(int fd, int mode, off_t offset, off_t len)
+{
+	int code = fallocate(fd, mode, offset, len);
+
+	if (code)
+		fprintf(stderr, "fallocate %d (mode): %s\n", mode,
+			strerror(errno));
+
+	return code;
+}
+
+static int safe_ftruncate(int fd, off_t length)
+{
+	int code = ftruncate(fd, length);
+
+	if (code)
+		perror("ftruncate");
+
+	return code;
+}
+
+static int mmap_collision()
+{
+	char cmd[100];
+	struct statvfs vfs;
+	unsigned long bsize;
+	struct file_args file;
+	int fsize;
+	int code = 1;
+
+	print_start(__func__);
+	strncpy(cmd, "xfs_io -F -f -c 'falloc 0 1m' xfs_io", sizeof(cmd));
+	if (system(cmd) || safe_statvfs("./", &vfs))
+		return 1;
+
+	bsize = vfs.f_bsize;
+	if (debug_xfs(bsize, "fpunch") || debug_xfs(bsize, "fcollapse") ||
+	    debug_xfs(bsize, "fzero"))
+		return 1;
+
+	file.pagesize = getpagesize();
+	fsize = file.pagesize * 4;
+	file.fd_write = safe_open("./testfile", O_RDWR|O_CREAT);
+	if (file.fd_write < 0)
+		return 1;
+
+	file.fd_read = safe_open("./testfile", O_RDWR|O_CREAT|O_DIRECT);
+	if (file.fd_read < 0)
+		goto write;
+
+	if (safe_ftruncate(file.fd_write, 0) ||
+	    safe_fallocate(file.fd_write, 0, 0, fsize) ||
+	    safe_ftruncate(file.fd_read, 0) ||
+	    safe_fallocate(file.fd_read, 0, 0, fsize))
+		goto read;
+
+	file.ptr = safe_mmap(NULL, fsize, PROT_READ|PROT_WRITE, MAP_SHARED,
+			     file.fd_write, 0);
+	if (file.ptr == MAP_FAILED)
+		goto read;
+
+	if (run_fileops(punch_hole, file) ||
+	    run_fileops(zero_range, file) ||
+	    run_fileops(truncate_down, file) ||
+	    run_fileops(collapse_range, file))
+		goto munmap;
+
+	printf("- pass: %s\n", __func__);
+	code = 0;
+munmap:
+	if (safe_munmap(file.ptr, fsize))
+		code = 1;
+read:
+	close(file.fd_read);
+write:
+	close(file.fd_write);
+
+	return code;
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -2334,6 +2588,9 @@ int main(int argc, char *argv[])
 	bugs[i] = new(i, memfd_huge, NULL, "create memfd in hugetlbfs.");
 	i++;
 	bugs[i] = new(i, fill_xfs, (void *)512, "fill up XFS repetitively.");
+	i++;
+	bugs[i] = new(i, mmap_collision, NULL,
+		"change inode block map before completing I/O.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhfk::lx:")) != -1) {
