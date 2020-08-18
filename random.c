@@ -88,12 +88,14 @@ static struct bug *new(int number, int (* func)(void *data), void *data,
 static int build_kernel();
 static int cap_cpu();
 static int cat(const char *from, FILE *fp_to);
+static int cmp_buf(char *b1, char *b2, int bsize);
 static void *collapse_range(void *data);
 static int copy(const char *from, const char *to);
 static int create_loopback(unsigned long megabyte);
 static int create_xfs(const char *dev, const char *mount);
 static void delete(struct bug *bug);
 static int delete_loopback(unsigned loopback);
+static void dump_buf(char *buf, int size, int blksz);
 static void end_string(char *string, size_t size, char end);
 static int fill_semget(void *data);
 static int fill_xfs(void *data);
@@ -102,7 +104,16 @@ static size_t get_meminfo(const char *field);
 static int get_numa(int *node1, int *node2);
 static int hotplug_cpu(void *data);
 static int hotplug_memory();
+static int invalidate_cache(unsigned children, unsigned iteration,
+			    unsigned blksz, bool dread, bool dwrite, bool trunc,
+			    bool falloc, bool fill);
+static int invalidate_pagecache_dio();
+static int invalidate(unsigned child, unsigned iteration, unsigned blksz,
+		      int rflag, int wflag);
+static void kill_children(pid_t *pids, unsigned children);
 static void list_bug(struct bug *bugs[]);
+static int loop_invalidate_cache(unsigned loop, unsigned iteration,
+				 unsigned blksz);
 static void loop_mmap(size_t length);
 static int loop_mmap_huge(void *data);
 static int loop_move_pages(int node1, int node2, size_t length);
@@ -154,9 +165,14 @@ static long safe_migrate_pages(int pid, unsigned long max_node,
 			       const unsigned long *new_nodes);
 static DIR *safe_opendir(const char *path);
 static int safe_open(const char *path, int flags);
+static int safe_posix_memalign(void **memptr, size_t alignment, size_t size);
+static int safe_pread(int fd, void *buf, size_t size, off_t offset,
+		      ssize_t expected);
 static int safe_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 			       void *(*start_routine)(void *), void *arg);
 static int safe_pthread_join(pthread_t thread, void **retval);
+static int safe_pwrite(int fd, const void *buf, size_t size, off_t offset,
+		       ssize_t expected);
 static int safe_statvfs(const char *path, struct statvfs *buf);
 static int safe_umount(const char *target);
 static int safe_unlink(const char *path);
@@ -168,6 +184,7 @@ static void *thread_mmap(void *data);
 static void *thread_write(void *data);
 static void *truncate_down(void *data);
 static void usage(const char *name);
+static int wait_children(pid_t *pids, int children);
 static int write_file(const char *path, char *buf, size_t size);
 static int write_value(const char *path, long value);
 static int debug_xfs(unsigned long bsize, char *ops);
@@ -2534,6 +2551,286 @@ write:
 	return code;
 }
 
+static int invalidate_pagecache_dio()
+{
+	int sectsz, i;
+	int pagesz = getpagesize();
+
+	print_start(__func__);
+
+	for (sectsz = 4096; sectsz <= pagesz * 2; sectsz *= 2) {
+		for (i = 0; i < 10; i++) {
+			if (loop_invalidate_cache(3, 1, sectsz))
+				return 1;
+		}
+		for (i = 0; i < 5; i++) {
+			if (loop_invalidate_cache(8, 4, sectsz))
+				return 1;
+		}
+	}
+	printf("- pass: %s\n", __func__);
+	return 0;
+}
+
+static int loop_invalidate_cache(unsigned children, unsigned iteration,
+				 unsigned blksz)
+{
+	int i;
+	struct seq {
+		bool dread;
+		bool dwrite;
+		bool trunc;
+		bool falloc;
+		bool fill;
+	};
+	struct seq seq_cache[] = {
+		{0, 1, 0, 0, 0},
+		{0, 1, 1, 0, 0},
+		{0, 1 ,0, 1, 0},
+		{0, 1, 0, 0, 1},
+		{1, 0, 0, 0, 0},
+		{1, 0, 1, 0, 0},
+		{1, 0, 0, 1, 0},
+		{1, 0, 0, 0, 1},
+		{1, 1, 0, 0, 0},
+		{1, 1, 1, 0, 0},
+		{1, 1, 0, 1, 0},
+		{1, 1, 0, 0, 1}
+	};
+
+	for (i = 0; i < sizeof(seq_cache) / sizeof(seq_cache[0]); i++) {
+		printf("- invalidate page caches: %u %u %u %u %u\n",
+		       seq_cache[i].dread, seq_cache[i].dwrite,
+		       seq_cache[i].trunc, seq_cache[i].falloc,
+		       seq_cache[i].fill);
+		if (invalidate_cache(children, iteration, blksz,
+				     seq_cache[i].dread,
+				     seq_cache[i].dwrite,
+				     seq_cache[i].trunc,
+				     seq_cache[i].falloc,
+				     seq_cache[i].fill))
+			return 1;
+	}
+	return 0;
+}
+
+static int cmp_buf(char *b1, char *b2, int bsize)
+{
+	int i;
+
+	for (i = 0; i < bsize; i++) {
+		if (b1[i] != b2[i]) {
+			fprintf(stderr,
+				"- error at offset %d: 0x%x != 0x%x\n", i,
+				b2[i], b1[i]);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void kill_children(pid_t *pids, unsigned children)
+{
+	int i;
+	pid_t pid;
+
+	for (i = 0; i < children; i++) {
+		pid = pids[i];
+		if (!pid)
+			continue;
+
+		kill(pid, SIGTERM);
+	}
+}
+
+static int wait_children(pid_t *pids, int children)
+{
+	int i, status;
+	unsigned ret = 0;
+	pid_t pid;
+
+	for (i = 0; i < children; i++) {
+		pid = pids[i];
+		if (!pid)
+			continue;
+
+		if (safe_waitpid(pid, &status, 0) < 0)
+			ret += 1;
+
+		ret += WEXITSTATUS(status);
+	}
+	return ret;
+}
+
+static int invalidate_cache(unsigned children, unsigned iteration,
+			    unsigned blksz, bool dread, bool dwrite, bool trunc,
+			    bool falloc, bool fill)
+{
+	pid_t pid, *pids;
+	int fd, i, ret;
+	int rflag = O_RDONLY;
+	int wflag = O_WRONLY;
+
+	pids = safe_malloc(children * sizeof(pid_t));
+	if (!pids)
+		return 1;
+
+	memset(pids, 0, children * sizeof(pid_t));
+
+	/* Create and truncate testfile first. */
+	fd = safe_open("./testfile", O_CREAT | O_TRUNC | O_RDWR);
+	if (fd < 0)
+		goto free;
+
+	if (trunc && safe_ftruncate(fd, blksz * children))
+		goto close;
+
+	if (fill) {
+		char *buf;
+		buf = safe_malloc(blksz * children);
+		if (!buf)
+			goto close;
+
+		memset(buf, 's', blksz * children);
+		write(fd, buf, blksz * children);
+		free(buf);
+	}
+	if (falloc && safe_fallocate(fd, 0, 0, blksz * children))
+		goto close;
+
+	if (safe_fsync(fd))
+		goto close;
+
+	if (safe_close(fd))
+		goto free;
+
+	if (dread)
+		rflag |= O_DIRECT;
+
+	if (dwrite)
+		wflag |= O_DIRECT;
+
+	for (i = 0; i < children; i++) {
+		pid = safe_fork();
+		switch(pid) {
+		case -1:
+			kill_children(pids, children);
+			goto free;
+		case 0:
+			exit(invalidate(i, iteration, blksz, rflag, wflag));
+		default:
+			pids[i] = pid;
+		}
+	}
+	ret = wait_children(pids, children);
+	free(pids);
+
+	return ret;
+close:
+	close(fd);
+free:
+	free(pids);
+	return 1;
+}
+
+static int safe_posix_memalign(void **memptr, size_t alignment, size_t size)
+{
+	int code = posix_memalign(memptr, alignment, size);
+
+	if (code)
+		perror("posix_memalign");
+
+	return code;
+}
+
+static int invalidate(unsigned child, unsigned iteration, unsigned blksz,
+		      int rflag, int wflag)
+{
+	off_t offset = blksz * child;
+	int pagesz = getpagesize();
+	int rfd, wfd, i;
+	unsigned code = 1;
+	char *rbuf, *wbuf;
+	size_t size = blksz > pagesz ? blksz : pagesz;
+
+	if (safe_posix_memalign((void **)&rbuf, pagesz, size) ||
+	    safe_posix_memalign((void **)&wbuf, pagesz, size))
+		return 1;
+
+	memset(rbuf, 0, blksz);
+	memset(wbuf, 0, blksz);
+	rfd = safe_open("./testfile", rflag);
+	if (rfd < 0)
+		return 1;
+
+	wfd = safe_open("./testfile", wflag);
+	if (wfd < 0)
+		goto close;
+
+	/* Seek, write, read and verify. */
+	for (i = 0; i < iteration; i++) {
+		memset(wbuf, i + 1, blksz);
+		if (safe_pwrite(wfd, wbuf, blksz, offset, blksz))
+			goto out;
+
+		/* Make sure buffer write hits disk before direct read. */
+		if (!(wflag & O_DIRECT) && safe_fsync(wfd))
+			goto out;
+
+		if (safe_pread(rfd, rbuf, blksz, offset, blksz))
+			goto out;
+
+		if (cmp_buf(wbuf, rbuf, blksz)) {
+			dump_buf(rbuf, blksz, blksz);
+			goto out;
+		}
+	}
+	code = 0;
+out:
+	code += safe_close(wfd);
+close:
+	code += safe_close(rfd);
+
+	return code;
+}
+
+static int safe_pread(int fd, void *buf, size_t size, off_t offset,
+		      ssize_t expected)
+{
+	ssize_t code = pread(fd, buf, size, offset);
+
+	if (code != expected) {
+		perror("pread");
+		return code;
+	}
+	return 0;
+}
+
+static int safe_pwrite(int fd, const void *buf, size_t size, off_t offset,
+		       ssize_t expected)
+{
+	ssize_t code = pwrite(fd, buf, size, offset);
+
+	if (code != expected) {
+		perror("pwrite");
+		return code;
+	}
+	return 0;
+}
+
+static void dump_buf(char *buf, int size, int blksz)
+{
+	int i;
+
+	printf("- dump buffer content:\n");
+	for (i = 0; i < size; i++) {
+		if (!(i % blksz) || !(i % 64))
+			putchar('\n');
+		printf("%x", buf[i]);
+	}
+	putchar('\n');
+}
+
 int main(int argc, char *argv[])
 {
 	size_t free_size, size;
@@ -2591,6 +2888,9 @@ int main(int argc, char *argv[])
 	i++;
 	bugs[i] = new(i, mmap_collision, NULL,
 		"change inode block map before completing I/O.");
+	i++;
+	bugs[i] = new(i, invalidate_pagecache_dio, NULL,
+		"invalidate page caches in buffer/direct write/read modes.");
 	i++;
 
 	while ((c = getopt(argc, argv, "bhfk::lx:")) != -1) {
