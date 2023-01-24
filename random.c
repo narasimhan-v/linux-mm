@@ -2370,6 +2370,12 @@ static void *punch_hole(void *data)
 				strerror(errno));
 			return (void *)1;
 		}
+                /*
+                 * Add sleep to avoid pread error while multiple threads being executed in parallel 
+                 * OR can even ignore pread errors like other functions - truncate_down,collapse_range
+		 * let us go with sleep, tested with 20 threads loop works fine.
+                 */
+                sleep(1);
 		rc = safe_fallocate(file.fd_write,
 				    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
 				    0, fsize);
